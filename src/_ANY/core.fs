@@ -1,3 +1,4 @@
-module Fake.Core1
+namespace Fake
+    module Core1=
 
-    printfn ""
+        printfn ""

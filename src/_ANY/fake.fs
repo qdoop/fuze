@@ -1,6 +1,7 @@
-module Fake.Fake1
+namespace Fake
+    module Fake1=
 
-printfn ""
+    printfn ""
 
 
 

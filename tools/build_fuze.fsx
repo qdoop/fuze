@@ -41,27 +41,29 @@ for file  in files do
     // printfn "reading... %A" file
     printfn "\n\n\n/////////////////// %s\n" file
     for line in readLines (srcDir+file) do
-        if false then
-            ()
-        elif 0=line.IndexOf("module") then
-            tab<-""
-            printfn "%s%s" tab line
+        // if false then
+        //     ()
+        // elif 0=line.IndexOf("module") then
+        //     tab<-""
+        //     printfn "%s%s" tab line
 
-        elif 0=line.IndexOf("namespace") then
-            tab<-""
-            printfn "%s%s" tab line
+        // elif 0=line.IndexOf("namespace") then
+        //     tab<-""
+        //     printfn "%s%s" tab line
 
-        elif -1<line.IndexOf("module") then
-            tab<-"____"
-            printfn "%s%s" tab line
+        // elif -1<line.IndexOf("module") then
+        //     tab<-"____"
+        //     printfn "%s%s" tab line
 
-        elif -1<line.IndexOf("namespace") then
-            tab<-"____"
-            printfn "%s%s" tab line
+        // elif -1<line.IndexOf("namespace") then
+        //     tab<-"____"
+        //     printfn "%s%s" tab line
 
 
-        else
-            ()
+        // else
+        //     ()
+
+        printfn "%s%s" tab line
 
 
     ()
