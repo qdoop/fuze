@@ -25,7 +25,7 @@ let inline isNullOrWhiteSpace value = isNullOrEmpty value || value |> Seq.forall
 let inline replace (pattern : string) replacement (text : string) = text.Replace(pattern, replacement)
 
 /// Converts a sequence of strings to a string with delimiters
-let inline separated (delimiter:char) (items : string seq) = String.Join(delimiter, Array.ofSeq items)
+let inline separated (delimiter:string) (items : string seq) = String.Join(delimiter, Array.ofSeq items)
 
 /// Removes the slashes from the end of the given string
 let inline trimSlash (s : string) = s.TrimEnd('\\')

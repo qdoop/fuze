@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>netcoreapp2.0</TargetFramework>
+    <!-- <OutputType>Exe</OutputType> -->
+    <TargetFramework>netstandard2.0</TargetFramework>
     <OutputPath>obj/_work/</OutputPath>
   </PropertyGroup>
 
@@ -19,7 +19,8 @@
 
   <ItemGroup>
     <Compile Include="_ANY/fake.fs" />
-    <Compile Include="_ANY/_xxx.fs" />
+    <Compile Include="_ANY/core.fs" />
+
     <Compile Include="Core/String.fs" />
     <Compile Include="Shell/Path.fs" />
     <Compile Include="Shell/FileSystemOperators.fs" />
@@ -36,7 +37,9 @@
     <Compile Include="Shell/Templates.fs" />
 
      <Compile Include="Shell/Shell.fs"/>
-    <!-- <Compile Include="Shell/D*.fs"/>  -->
+
+     <Compile Include="Shell/ChangeWatcher.fs"/>
+
   </ItemGroup>
 
 </Project>
