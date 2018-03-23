@@ -1,0 +1,100 @@
+///////Building...
+
+
+
+/////////////////// Core/String.fs
+
+module Fake.Core.String
+module Operators =
+
+
+
+/////////////////// shell/Path.fs
+
+module Fake.IO.Path
+
+
+
+/////////////////// Shell/FileSystemOperators.fs
+
+namespace Fake.IO
+module FileSystemOperators =
+
+
+
+/////////////////// Shell/DirectoryInfo.fs
+
+namespace Fake.IO
+module DirectoryInfo =
+
+
+
+/////////////////// Shell/FileInfo.fs
+
+namespace Fake.IO
+module FileInfo =
+
+
+
+/////////////////// Shell/Directory.fs
+
+namespace Fake.IO
+module Directory =
+
+
+
+/////////////////// Shell/File.fs
+
+namespace Fake.IO
+module FileFilter =
+module File =
+
+
+
+/////////////////// Shell/FileSystemInfo.fs
+
+namespace Fake.IO
+module FileSystemInfo =
+
+
+
+/////////////////// Shell/Globbing.fs
+
+____/// This module contains a file pattern globbing implementation.
+module Fake.IO.Globbing.Glob
+
+
+
+/////////////////// Shell/GlobbingFileSystem.fs
+
+____/// This module contains a file pattern globbing implementation.
+namespace Fake.IO
+namespace Fake.IO.Globbing
+namespace Fake.IO
+module GlobbingPatternExtensions =
+module GlobbingPattern =
+namespace Fake.IO.Globbing
+module FileIncludes =
+module Operators =
+module Tools =
+
+
+
+/////////////////// Shell/Templates.fs
+
+____/// NOTE: Maybe this should be an extra module?
+module Fake.IO.Templates
+
+
+
+/////////////////// Shell/Shell.fs
+
+namespace Fake.IO
+module Shell =
+
+
+
+/////////////////// Shell/ChangeWatcher.fs
+
+____/// This module contains helpers to react to file system events.
+module Fake.IO.FileSystem.ChangeWatcher

@@ -26,19 +26,14 @@
     <Compile Include="Shell/FileSystemOperators.fs" />
     <Compile Include="Shell/DirectoryInfo.fs" />
     <Compile Include="Shell/FileInfo.fs" />
-        <Compile Include="Shell/Directory.fs" />
-            <Compile Include="Shell/File.fs" />
-
-            <Compile Include="Shell/FileSystemInfo.fs" />
-
+    <Compile Include="Shell/Directory.fs" />
+    <Compile Include="Shell/File.fs" />
+    <Compile Include="Shell/FileSystemInfo.fs" />
     <Compile Include="Shell/Globbing.fs" />
     <Compile Include="Shell/GlobbingFileSystem.fs" />
-
     <Compile Include="Shell/Templates.fs" />
-
-     <Compile Include="Shell/Shell.fs"/>
-
-     <Compile Include="Shell/ChangeWatcher.fs"/>
+    <Compile Include="Shell/Shell.fs"/>
+    <Compile Include="Shell/ChangeWatcher.fs"/>
 
   </ItemGroup>
 
