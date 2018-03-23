@@ -1,0 +1,6 @@
+module fuze
+
+
+
+printfn "hello"
+
