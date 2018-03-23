@@ -11,7 +11,7 @@ module String=
 
 
     /// [omit]
-    let productName() = "FAKE"
+    let productName() = "FUZE"
 
     /// Returns if the string is null or empty
     let inline isNullOrEmpty value = String.IsNullOrEmpty value

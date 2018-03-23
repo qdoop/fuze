@@ -6,6 +6,8 @@
     <OutputPath>obj/_work/</OutputPath>
   </PropertyGroup>
 
+<!-- IMPORTANT THIS PROJECT JUST CHECKS INTEGRITY OF THE CODE 
+     DOES NOT PRODUCE ANY OUTPUT -->
 
   <ItemGroup>
     <Compile Include="_ANY/fake.fs" />

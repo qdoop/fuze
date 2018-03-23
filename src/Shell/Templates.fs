@@ -1,8 +1,8 @@
     /// NOTE: Maybe this should be an extra module?
     /// Contains basic templating functions. Used in other helpers.
 namespace Fake.IO
-    [<RequireQualifiedAccess>]
-    module Templates=
+[<RequireQualifiedAccess>]
+module Templates=
 
     /// Loads all templates (lazy - line by line!)
     let load seq = Seq.map (fun fileName -> fileName, File.read fileName) seq
