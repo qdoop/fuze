@@ -18,6 +18,8 @@
     <Compile Include="_ANY/core.fs" />
 
     <Compile Include="Core/String.fs" />
+    <Compile Include="Core/StringBuilder.fs" />
+    <Compile Include="Core/SemVer.fs" />
 
     <Compile Include="Shell/Path.fs" />
     <Compile Include="Shell/FileSystemOperators.fs" />

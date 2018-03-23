@@ -1,0 +1,13 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "interactiveBuild",
+            "type": "shell",
+            "command": "nodemon -e fsx,fs,fsproj   -w tools -w src       --exec   cmd /C tools\\build.cmd",
+            "problemMatcher": []
+        }
+    ]
+}
