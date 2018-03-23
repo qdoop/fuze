@@ -1,9 +1,11 @@
-module Fuse.Shell
+﻿/// Shell-like functions. Similar to [Ruby's FileUtils](http://www.ruby-doc.org/stdlib-2.0.0/libdoc/rake/rdoc/FileUtils.html).
+namespace Fake.IO
 
 open System.IO
+open Fake.Core
+open Fake.IO.FileSystemOperators
 
-printfn "shell"
-
+[<RequireQualifiedAccess>]
 module Shell =
 
     /// Copies a single file to the target and overwrites the existing file.

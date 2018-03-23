@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>netcoreapp2.0</TargetFramework>
+    <OutputPath>obj/_work/</OutputPath>
+  </PropertyGroup>
+
+
+  <!-- <ItemGroup>
+    <ProjectReference Include="..\app0library\app0library.csproj" />
+    <ProjectReference Include="..\XFanoutSearch\XFanoutSearch.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="GraphEngine.Core" Version="1.0.9083" />
+  </ItemGroup> -->
+
+
+  <ItemGroup>
+    <Compile Include="_ANY/fake.fs" />
+    <Compile Include="_ANY/_xxx.fs" />
+    <Compile Include="Core/String.fs" />
+    <Compile Include="Shell/Path.fs" />
+    <Compile Include="Shell/FileSystemOperators.fs" />
+    <Compile Include="Shell/DirectoryInfo.fs" />
+    <Compile Include="Shell/FileInfo.fs" />
+        <Compile Include="Shell/Directory.fs" />
+            <Compile Include="Shell/File.fs" />
+
+            <Compile Include="Shell/FileSystemInfo.fs" />
+
+    <Compile Include="Shell/Globbing.fs" />
+    <Compile Include="Shell/GlobbingFileSystem.fs" />
+
+    <Compile Include="Shell/Templates.fs" />
+
+     <Compile Include="Shell/Shell.fs"/>
+    <!-- <Compile Include="Shell/D*.fs"/>  -->
+  </ItemGroup>
+
+</Project>

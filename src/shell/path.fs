@@ -1,9 +1,9 @@
+﻿/// Contains helper function which allow to deal with files and directories.
 [<RequireQualifiedAccess>]
 module Fake.IO.Path
 
-// open Fake.Core
-// open Fake.Core.String.Operators
-
+open Fake.Core
+open Fake.Core.String.Operators
 open System
 open System.IO
 open System.Collections.Generic
