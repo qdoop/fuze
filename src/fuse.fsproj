@@ -7,16 +7,6 @@
   </PropertyGroup>
 
 
-  <!-- <ItemGroup>
-    <ProjectReference Include="..\app0library\app0library.csproj" />
-    <ProjectReference Include="..\XFanoutSearch\XFanoutSearch.csproj" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="GraphEngine.Core" Version="1.0.9083" />
-  </ItemGroup> -->
-
-
   <ItemGroup>
     <Compile Include="_ANY/fake.fs" />
     <Compile Include="_ANY/core.fs" />
