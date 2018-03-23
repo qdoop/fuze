@@ -1,7 +1,7 @@
 
 namespace Fuze
 module Main=
-    [<EntryPoint>]
+    // [<EntryPoint>]
     let main (vargs :string[]) = 
         TracerA.trace vargs
         zlog vargs
@@ -10,8 +10,6 @@ module Main=
         vargs |> zlog
 
         0
-
-
 
 
 // printfn ""

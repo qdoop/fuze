@@ -18,7 +18,7 @@
     <Compile Include="_ANY/core.fs" />
 
     <Compile Include="Core/String.fs" />
-    
+
     <Compile Include="Shell/Path.fs" />
     <Compile Include="Shell/FileSystemOperators.fs" />
     <Compile Include="Shell/DirectoryInfo.fs" />
@@ -31,6 +31,20 @@
     <Compile Include="Shell/Templates.fs" />
     <Compile Include="Shell/Shell.fs"/>
     <Compile Include="Shell/ChangeWatcher.fs"/>
+
+
+    <Compile Include="Runtime/LegacyApiHelper.fs" />
+    <Compile Include="Runtime/Environment.fs" />
+    <Compile Include="Runtime/Path.fs" />
+    <Compile Include="Runtime/String.fs" />
+    <Compile1 Include="Runtime/Trace.fs" />
+    <Compile1 Include="Runtime/Runners.fs" />
+    <Compile1 Include="Runtime/CompileRunner.fs" />
+    <Compile1 Include="Runtime/ScriptRunner.fs" />
+    <Compile1 Include="Runtime/FSharpParser.fs" />
+    <Compile1 Include="Runtime/HashGeneration.fs" />
+    <Compile1 Include="Runtime/CoreCache.fs" />
+    <Compile1 Include="Runtime/FakeRuntime.fs" />
 
 
     <Compile Include="Bootstrap/Main.fs" />

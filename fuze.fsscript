@@ -1,4 +1,4 @@
-//// Build: 180323T200400.095Z
+//// Build: 180323T221657.349Z
 
 
 
@@ -1707,12 +1707,129 @@ module ChangeWatcher=
 
 
 
+//// //// //// //// Runtime/LegacyApiHelper.fs
+
+
+
+namespace Fuze.Runtime
+module LegacyApiHelper=
+
+  type NewApiMutableHelper<'a> = { Set : 'a -> unit; Get : unit -> 'a }
+
+  let ofRef r = { Set = (fun v -> r := v); Get = (fun () -> !r) }
+  let toGetSet f =
+    (fun () ->
+      let { Get = g } = f()
+      g()),
+    (fun v ->
+      let { Set = s } = f()
+      s v)
+
+
+
+
+//// //// //// //// Runtime/Environment.fs
+
+    /// This module contains functions which allow to read and write environment variables and build parameters
+
+namespace Fuze.Runtime
+module Environment=
+    //type Environment = System.Environment
+
+    open System
+    open System.IO
+
+    /// Gets the FAKE version no.
+    let fakeVersion = "xxxx" // AssemblyVersionInformation .AssemblyInformationalVersion
+
+    /// Gets the FAKE Version string
+    let fakeVersionStr = sprintf "FAKE 5 - F# Make (%s)" fakeVersion
+
+    /// Retrieves the environment variable with the given name
+    let environVar name = System.Environment.GetEnvironmentVariable name
+
+    /// Retrieves all environment variables from the given target
+
+    let environVars () = 
+        let vars = System.Environment.GetEnvironmentVariables ()
+        [ for e in vars -> 
+              let e1 = e :?> Collections.DictionaryEntry
+              e1.Key, e1.Value ]
+
+    /// Sets the environment variable with the given name
+    let setEnvironVar name value = System.Environment.SetEnvironmentVariable(name, value)
+
+    /// Retrieves the environment variable with the given name or returns the default if no value was set
+    let environVarOrDefault name defaultValue = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then defaultValue
+        else var
+
+    /// Retrieves the environment variable with the given name or fails if not found
+    let environVarOrFail name = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then failwith <| sprintf "Environment variable '%s' not found" name
+        else var
+
+    /// Retrieves the environment variable with the given name or returns the default bool if no value was set
+    let getEnvironmentVarAsBoolOrDefault varName defaultValue =
+        try  
+            (environVar varName).ToUpper() = "TRUE" 
+        with
+        | _ ->  defaultValue
+
+    /// Retrieves the environment variable with the given name or returns the false if no value was set
+    let getEnvironmentVarAsBool varName = getEnvironmentVarAsBoolOrDefault varName false
+
+    /// Retrieves the environment variable or None
+    let environVarOrNone name = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then None
+        else Some var
+
+    /// Returns if the build parameter with the given name was set
+    let inline hasEnvironVar name = environVar name |> isNull |> not
+
+
+
+//// //// //// //// Runtime/Path.fs
+
+    /// Contains basic functions for string manipulation.
+namespace Fuze.Runtime
+module Path=
+    open System.IO
+
+    // Normalizes path for different OS
+    let inline normalizePath (path : string) = 
+        path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar)
+
+    let getCurrentDirectory () =
+        System.IO.Directory.GetCurrentDirectory()
+
+
+
+//// //// //// //// Runtime/String.fs
+
+    /// Contains basic functions for string manipulation.
+namespace Fuze.Runtime
+module String=
+    type String = System.String
+    open System
+
+    /// Returns if the string is null or empty
+    let inline isNullOrEmpty value = String.IsNullOrEmpty value
+
+    /// Returns if the string is not null or empty
+    let inline isNotNullOrEmpty value = String.IsNullOrEmpty value |> not
+
+
+
 //// //// //// //// Bootstrap/Main.fs
 
 
 namespace Fuze
 module Main=
-    [<EntryPoint>]
+    // [<EntryPoint>]
     let main (vargs :string[]) = 
         TracerA.trace vargs
         zlog vargs
@@ -1721,8 +1838,6 @@ module Main=
         vargs |> zlog
 
         0
-
-
 
 
 // printfn ""

@@ -1,21 +1,17 @@
 
-open System.IO
+
 
 (*
 
-  nodemon -e fsx,fs   -w tools -w src       --exec   cmd /C tools\build.cmd
+  nodemon -e fsx,fs,fsproj   -w tools -w src       --exec   cmd /C tools\build.cmd
 
 *)
 
-
-
-
-
-
-
 open System
+open System.IO
 
 let srcDir="src/"
+
 
 
 
