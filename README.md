@@ -5,6 +5,10 @@ Project automation as a standalone dense .fsscript.
 No additional package downloads/installs needed.<br>
 Lightweight and portable plain scripting.
 
+To get see a proof of consept in action just run
+```
+fsi.exe  fz.fsx
+```
 
 ## Motivation
 Provide selected functionality from
