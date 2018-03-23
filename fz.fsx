@@ -1,9 +1,10 @@
 
 
+printfn "Running..."
+
 #load @"fuze.fsscript"
 
-printfn "done!!!! %A"  (Fake.Core.String.productName())
 
 
+printfn "done!!!! %A"  (Fuze.Main.main [|"-arg0"|])
 
-printfn "done!!!! %A"  (Fake.IO.Shell.pwd())

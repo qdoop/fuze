@@ -1,12 +1,67 @@
-///////Building...
+//// Build: 180323T200400.095Z
 
 
 
-/////////////////// Core/String.fs
+//// //// //// //// Bootstrap/Init.fs
+
+namespace Fuze
+
+#nowarn "20"
+
+open System.Diagnostics
+open System.Runtime.CompilerServices
+type TracerA() =
+    static member trace(  args,
+                            [<CallerMemberName>] ?memberName: string,
+                            [<CallerFilePath>]   ?path: string,
+                            [<CallerLineNumber>] ?line: int            )  =
+        match (memberName, path, line) with
+        | Some m, Some p, Some l ->
+            printfn "[:%s:%6i] %s( %A )" "fuze.fsscript" l m args
+        | _,_,_ -> ()
+
+type zlog(args :obj) =
+    do
+        printfn "zlog: %A" args
+
+
+
+module Fuze =
+    open System.Diagnostics
+    open System.Runtime.CompilerServices
+
+
+module Init =
+    let init args =
+        printfn "init( %A )" args
+
+
+
+//// //// //// //// _ANY/fake.fs
+
+namespace Fake
+module Fake1=
+    printfn ""
+
+
+
+
+
+
+//// //// //// //// _ANY/core.fs
+
+namespace Fake
+module Core1=
+
+    printfn ""
+
+
+
+//// //// //// //// Core/String.fs
 
     /// Contains basic functions for string manipulation.
-    // [<RequireQualifiedAccess>]
-namespace Fake.Core
+namespace Fuze.Core
+[<RequireQualifiedAccess>]
 module String=
     type String = System.String
 
@@ -199,15 +254,15 @@ module String=
 
 
 
-/////////////////// shell/Path.fs
+//// //// //// //// Shell/Path.fs
 
    /// Contains helper function which allow to deal with files and directories.
-namespace Fake.IO
+namespace Fuze.IO
 [<RequireQualifiedAccess>]
 module Path=
 
-    open Fake.Core
-    open Fake.Core.String.Operators
+    open Fuze.Core
+    open Fuze.Core.String.Operators
     open System
     open System.IO
     open System.Collections.Generic
@@ -338,9 +393,9 @@ module Path=
 
 
 
-/////////////////// Shell/FileSystemOperators.fs
+//// //// //// //// Shell/FileSystemOperators.fs
 
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.IO
 
@@ -352,12 +407,12 @@ module FileSystemOperators =
 
 
 
-/////////////////// Shell/DirectoryInfo.fs
+//// //// //// //// Shell/DirectoryInfo.fs
 
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.IO
-open Fake.IO.FileSystemOperators
+open Fuze.IO.FileSystemOperators
 
 [<RequireQualifiedAccess>]
 module DirectoryInfo =
@@ -445,9 +500,9 @@ module DirectoryInfo =
 
 
 
-/////////////////// Shell/FileInfo.fs
+//// //// //// //// Shell/FileInfo.fs
 
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.IO
 
@@ -480,9 +535,9 @@ module FileInfo =
 
 
 
-/////////////////// Shell/Directory.fs
+//// //// //// //// Shell/Directory.fs
 
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.IO
 
@@ -520,14 +575,14 @@ module Directory =
 
 
 
-/////////////////// Shell/File.fs
+//// //// //// //// Shell/File.fs
 
 /// Contains helpers which allow to interact with the file system.
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.Text
 open System.IO
-open Fake.Core
+open Fuze.Core
 open Operators
 
 [<RequireQualifiedAccess>]
@@ -673,9 +728,9 @@ module File =
 
 
 
-/////////////////// Shell/FileSystemInfo.fs
+//// //// //// //// Shell/FileSystemInfo.fs
 
-namespace Fake.IO
+namespace Fuze.IO
 
 open System
 open System.IO
@@ -707,10 +762,10 @@ module FileSystemInfo =
 
 
 
-/////////////////// Shell/Globbing.fs
+//// //// //// //// Shell/Globbing.fs
 
     /// This module contains a file pattern globbing implementation.
-namespace Fake.IO.Globbing
+namespace Fuze.IO.Globbing
 module Glob=
 
     open System
@@ -869,10 +924,10 @@ module Glob=
 
 
 
-/////////////////// Shell/GlobbingFileSystem.fs
+//// //// //// //// Shell/GlobbingFileSystem.fs
 
 /// This module contains a file pattern globbing implementation.
-namespace Fake.IO
+namespace Fuze.IO
 open System.Collections.Generic
 
 type IGlobbingPattern =
@@ -881,8 +936,8 @@ type IGlobbingPattern =
     abstract Includes : string list
     abstract Excludes : string list
 
-namespace Fake.IO.Globbing
-open Fake.IO
+namespace Fuze.IO.Globbing
+open Fuze.IO
 open System.Collections.Generic
 
 type LazyGlobbingPattern =
@@ -934,9 +989,9 @@ type ResolvedGlobbingPattern =
         member this.GetEnumerator() = (this.Results :> IEnumerable<string>).GetEnumerator()
         member this.GetEnumerator() = (this :> IEnumerable<string>).GetEnumerator() :> System.Collections.IEnumerator
 
-namespace Fake.IO
+namespace Fuze.IO
 open System.IO
-open Fake.IO.Globbing
+open Fuze.IO.Globbing
 
 [<AutoOpen>] // A bit of a hack but we need those extensions for backwards compat.
 module GlobbingPatternExtensions =
@@ -1015,9 +1070,9 @@ module GlobbingPattern =
                             |> not)
             |> Seq.toList
 
-namespace Fake.IO.Globbing
+namespace Fuze.IO.Globbing
 
-open Fake.IO
+open Fuze.IO
 open System.IO
 
 // Compat
@@ -1080,11 +1135,11 @@ module Tools =
 
 
 
-/////////////////// Shell/Templates.fs
+//// //// //// //// Shell/Templates.fs
 
     /// NOTE: Maybe this should be an extra module?
     /// Contains basic templating functions. Used in other helpers.
-namespace Fake.IO
+namespace Fuze.IO
 [<RequireQualifiedAccess>]
 module Templates=
 
@@ -1113,14 +1168,14 @@ module Templates=
 
 
 
-/////////////////// Shell/Shell.fs
+//// //// //// //// Shell/Shell.fs
 
 /// Shell-like functions. Similar to [Ruby's FileUtils](http://www.ruby-doc.org/stdlib-2.0.0/libdoc/rake/rdoc/FileUtils.html).
-namespace Fake.IO
+namespace Fuze.IO
 
 open System.IO
-open Fake.Core
-open Fake.IO.FileSystemOperators
+open Fuze.Core
+open Fuze.IO.FileSystemOperators
 
 [<RequireQualifiedAccess>]
 module Shell =
@@ -1396,7 +1451,7 @@ module Shell =
     | ExcludePattern of string
     | Filter of (DirectoryInfo -> FileInfo -> bool)
 
-    open Fake.IO.Globbing.Glob
+    open Fuze.IO.Globbing.Glob
     /// Copies the file structure recursively.
     /// ## Parameters
     /// 
@@ -1526,15 +1581,15 @@ module Shell =
 
 
 
-/////////////////// Shell/ChangeWatcher.fs
+//// //// //// //// Shell/ChangeWatcher.fs
 
 /// This module contains helpers to react to file system events.
-namespace Fake.IO.FileSystem
+namespace Fuze.IO.FileSystem
 module ChangeWatcher=
 
     open System.IO
-    open Fake.Core
-    open Fake.IO
+    open Fuze.Core
+    open Fuze.IO
     open System.Threading
     open System
 
@@ -1649,3 +1704,25 @@ module ChangeWatcher=
 
 
     let Run (onChange : FileChange seq -> unit) (fileIncludes : IGlobbingPattern) = RunWithOptions { IncludeSubdirectories = true } onChange fileIncludes
+
+
+
+//// //// //// //// Bootstrap/Main.fs
+
+
+namespace Fuze
+module Main=
+    [<EntryPoint>]
+    let main (vargs :string[]) = 
+        TracerA.trace vargs
+        zlog vargs
+        Core.String.productName() |> zlog
+        IO.Shell.pwd() |> zlog
+        vargs |> zlog
+
+        0
+
+
+
+
+// printfn ""

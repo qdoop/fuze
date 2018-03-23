@@ -1,6 +1,6 @@
     /// Contains basic functions for string manipulation.
-    // [<RequireQualifiedAccess>]
 namespace Fake.Core
+[<RequireQualifiedAccess>]
 module String=
     type String = System.String
 

@@ -1,6 +1,5 @@
 namespace Fake
-    module Fake1=
-
+module Fake1=
     printfn ""
 
 

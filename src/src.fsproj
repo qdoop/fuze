@@ -1,19 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- <OutputType>Exe</OutputType> -->
     <TargetFramework>netstandard2.0</TargetFramework>
     <OutputPath>obj/_work/</OutputPath>
   </PropertyGroup>
 
-<!-- IMPORTANT THIS PROJECT JUST CHECKS INTEGRITY OF THE CODE 
-     DOES NOT PRODUCE ANY OUTPUT -->
+<!-- 
+     IMPORTANT THIS PROJECT JUST CHECKS INTEGRITY OF THE CODE.
+     AlSO IS USED FROM build_fuze.fsx TO SPECIFY WHICH FILES TO AMALGAMATE AND IN WHAT ORDER
+     DOES NOT PRODUCE ANY OUTPUT
+-->
 
   <ItemGroup>
+    <Compile Include="Bootstrap/Init.fs" />
+
     <Compile Include="_ANY/fake.fs" />
     <Compile Include="_ANY/core.fs" />
 
     <Compile Include="Core/String.fs" />
+    
     <Compile Include="Shell/Path.fs" />
     <Compile Include="Shell/FileSystemOperators.fs" />
     <Compile Include="Shell/DirectoryInfo.fs" />
@@ -27,6 +32,8 @@
     <Compile Include="Shell/Shell.fs"/>
     <Compile Include="Shell/ChangeWatcher.fs"/>
 
+
+    <Compile Include="Bootstrap/Main.fs" />
   </ItemGroup>
 
 </Project>
