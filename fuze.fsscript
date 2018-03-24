@@ -1,4 +1,4 @@
-//// Build: 180324T005325.394Z
+//// Build: 180324T152356.863Z
 
 
 
@@ -10,6 +10,7 @@ namespace Fuze
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
+open System.Linq
 type TracerA() =
     static member trace(  args,
                             [<CallerMemberName>] ?memberName: string,
@@ -17,7 +18,7 @@ type TracerA() =
                             [<CallerLineNumber>] ?line: int            )  =
         match (memberName, path, line) with
         | Some m, Some p, Some l ->
-            printfn "[:%s:%6i] %s( %A )" "fuze.fsscript" l m args
+            printfn "[:%13s:%5i] %s( %A )" (p.ToString().Split('\\').Last()) l m args
         | _,_,_ -> ()
 
 type zlog(args :obj) =
@@ -845,6 +846,182 @@ module Context=
         if isFakeContext() then
           setFakeVar name v |> ignore
         else varWithoutContext <- Some v)
+
+
+
+//// //// //// //// Core/ReleaseNotes.fs
+
+    /// Contains helpers which allow to parse Release Notes text files. Either "simple" or "complex" format is accepted.
+    ///
+    /// ## Formats
+    ///
+    /// ### Simple format
+    ///
+    ///     * 1.1.10 - Support for heterogeneous XML attributes. Make CsvFile re-entrant.
+    ///     * 1.1.9 - Infer booleans for ints that only manifest 0 and 1.
+    ///
+    /// ### Complex format
+    ///
+    ///     ### New in 1.1.10 (Released 2013/09/12)
+    ///     * Support for heterogeneous XML attributes.
+    ///     * Make CsvFile re-entrant. 
+    ///     * Support for compressed HTTP responses. 
+    ///     * Fix JSON conversion of 0 and 1 to booleans.
+    ///
+    ///     ### New in 1.1.9 (Released 2013/07/21)
+    ///     * Infer booleans for ints that only manifest 0 and 1.    
+    ///     * Support for partially overriding the Schema in CsvProvider.
+    ///     * PreferOptionals and SafeMode parameters for CsvProvider.
+    ///
+    /// ## Sample
+    ///
+    ///     let release =
+    ///         ReadFile "RELEASE_NOTES.md"
+    ///         |> ReleaseNotesHelper.parseReleaseNotes
+    ///
+    ///
+    ///     Target "AssemblyInfo" (fun _ ->
+    ///         CreateFSharpAssemblyInfo "src/Common/AssemblyInfo.fs"
+    ///           [ Attribute.Title project
+    ///             Attribute.Product project
+    ///             Attribute.Description summary
+    ///             Attribute.Version release.AssemblyVersion
+    ///             Attribute.FileVersion release.AssemblyVersion]
+    ///     )
+
+namespace Fuze.Core    
+[<RequireQualifiedAccess>]
+module ReleaseNotes=
+
+    open System
+    open Fuze.Core
+
+    /// Contains the parsed information of the release notes text file.
+    type ReleaseNotes =
+        { /// The parsed version.
+          AssemblyVersion: string
+          /// The nuget package version.
+          NugetVersion: string
+          /// Semantic version
+          SemVer: SemVerInfo
+          /// Release date
+          Date : DateTime option
+          // The parsed release notes.
+          Notes: string list }
+        override x.ToString() = sprintf "%A" x
+
+        static member New(assemblyVersion,nugetVersion,date,notes) = { 
+            AssemblyVersion = assemblyVersion
+            NugetVersion = nugetVersion
+            SemVer = SemVer.parse nugetVersion
+            Date = date
+            Notes = notes }
+
+        static member New(assemblyVersion,nugetVersion,notes) = ReleaseNotes.New(assemblyVersion,nugetVersion,None,notes)
+
+    let private parseVersions =
+        let nugetRegex = String.getRegEx @"([0-9]+.)+[0-9]+(-[a-zA-Z]+\d*)?(.[0-9]+)?"
+        let assemblyVersionRegex = String.getRegEx @"([0-9]+.)+[0-9]+"
+        fun line ->
+            let assemblyVersion = assemblyVersionRegex.Match line
+            if not assemblyVersion.Success
+            then failwithf "Unable to parse valid Assembly version from release notes (%s)." line
+
+            let nugetVersion = nugetRegex.Match line
+            if not nugetVersion.Success
+            then failwithf "Unable to parse valid NuGet version from release notes (%s)." line
+            assemblyVersion, nugetVersion
+
+    let private parseDate =
+        let dateRegex = String.getRegEx @"(19|20)\d\d([- /.])(0[1-9]|1[012]|[1-9])\2(0[1-9]|[12][0-9]|3[01]|[1-9])"
+        fun line ->
+            let possibleDate = dateRegex.Match line
+            match possibleDate.Success with
+            | false -> None
+            | true ->
+                match DateTime.TryParse possibleDate.Value with
+                | false, _ -> None
+                | true, x -> Some(x)
+
+    /// Parse simple release notes sequence
+    let private parseSimple line =
+        let assemblyVersion, nugetVersion = parseVersions line
+        let trimDot (s:string) = s.TrimEnd('.')
+
+        let notes = 
+            line.Substring (nugetVersion.Index + nugetVersion.Length)
+            |> String.trimChars [|' '; '-'|]
+            |> String.splitStr ". "
+            |> List.map (trimDot >> String.trim)
+            |> List.filter String.isNotNullOrEmpty
+            |> List.map (fun x -> x + ".")
+        ReleaseNotes.New(assemblyVersion.Value, nugetVersion.Value, None, notes)
+
+    open Fuze.Core.String.Operators
+
+    /// Parse "complex" release notes text sequence
+    let private parseAllComplex (text: seq<string>) =
+        let rec findNextNotesBlock text =
+            let isHeader line = "##" <* line
+            let rec findEnd notes text =
+                match text with
+                | [] -> notes,[]
+                | h :: rest -> if isHeader h then notes,text else findEnd (h :: notes) rest
+
+            match text with
+            | [] -> None
+            | h :: rest -> if isHeader h then Some(h,findEnd [] rest) else findNextNotesBlock rest
+
+        let rec loop releaseNotes text =
+            match findNextNotesBlock text with
+            | Some(header,(notes, rest)) ->
+                let assemblyVer, nugetVer = parseVersions header
+                let date = parseDate header
+                let newReleaseNotes = ReleaseNotes.New(assemblyVer.Value,nugetVer.Value,date,notes |> List.filter String.isNotNullOrEmpty |> List.rev)
+                loop (newReleaseNotes::releaseNotes) rest
+            | None -> releaseNotes
+
+        loop [] (text |> Seq.map (String.trimStartChars [|' '; '*'|] >> String.trimEndChars [|' '|]) |> Seq.toList)
+
+
+    /// Parses a Release Notes text and returns all release notes.
+    ///
+    /// ## Parameters
+    ///  - `data` - Release notes text
+    let parseAll (data: seq<string>) = 
+        let data = data |> Seq.toList |> List.filter (not << String.isNullOrWhiteSpace)
+        match data with
+        | [] -> failwith "Empty Release file."
+        | h :: _ ->
+            let (|Simple|Complex|Invalid|) = function '*' -> Simple | '#' -> Complex | _ -> Invalid
+            let firstNonEmptyChar = h.Trim([|'-'; ' '|]).[0]
+            match firstNonEmptyChar with
+            | Simple -> 
+                data 
+                |> Seq.map parseSimple
+                |> Seq.toList
+            | Complex -> parseAllComplex data
+            | Invalid -> failwith "Invalid Release Notes format."
+            |> List.sortBy (fun x -> x.SemVer)
+            |> List.rev
+
+        
+    /// Parses a Release Notes text and returns the lastest release notes.
+    ///
+    /// ## Parameters
+    ///  - `data` - Release notes text
+    let parse (data: seq<string>) =
+        data
+        |> parseAll
+        |> Seq.head
+
+    /// Parses a Release Notes text file and returns the lastest release notes.
+    ///
+    /// ## Parameters
+    ///  - `fileName` - Release notes text file name
+    let load fileName =
+        System.IO.File.ReadLines fileName
+        |> parse
 
 
 
@@ -6285,20 +6462,301 @@ module String=
 
 
 
+//// //// //// //// Runtime/Trace.fs
+
+    /// This module contains function which allow to trace build output
+namespace Fuze.Runtime
+module Trace=
+    open Fuze.Runtime.Environment
+
+    open System
+    open System.IO
+    open System.Reflection
+    open System.Threading
+
+    /// Defines Tracing information for TraceListeners
+    type TraceData =
+        | ImportantMessage of string
+        | ErrorMessage of string
+        | LogMessage of string * bool
+        | TraceMessage of string * bool
+        member x.NewLine =
+            match x with
+            | ImportantMessage _
+            | ErrorMessage _ -> Some true
+            | LogMessage (_, newLine)
+            | TraceMessage (_, newLine) -> Some newLine
+        member x.Message =
+            match x with
+            | ImportantMessage text
+            | ErrorMessage text
+            | LogMessage (text, _)
+            | TraceMessage (text, _) -> Some text
+
+    /// Defines a TraceListener interface
+    type ITraceListener = 
+        abstract Write : TraceData -> unit
+
+    /// A default color map which maps TracePriorities to ConsoleColors
+    let colorMap traceData = 
+        match traceData with
+        | ImportantMessage _ -> ConsoleColor.Yellow
+        | ErrorMessage _ -> ConsoleColor.Red
+        | LogMessage _ -> ConsoleColor.Gray
+        | TraceMessage _ -> ConsoleColor.Green
+
+    /// Implements a TraceListener for System.Console.
+    /// ## Parameters
+    ///  - `importantMessagesToStdErr` - Defines whether to trace important messages to StdErr.
+    ///  - `colorMap` - A function which maps TracePriorities to ConsoleColors.
+    type ConsoleTraceListener(colorMap) =
+        let writeText color newLine text = 
+            let curColor = Console.ForegroundColor
+            try
+              if curColor <> color then Console.ForegroundColor <- color
+              let printer =
+                match newLine with
+                | true -> printfn
+                | false -> printf
+              printer "%s" text
+            finally
+              if curColor <> color then Console.ForegroundColor <- curColor
+        
+        interface ITraceListener with
+            /// Writes the given message to the Console.
+            member this.Write msg = 
+                let color = colorMap msg
+                match msg with
+                | ImportantMessage text | ErrorMessage text ->
+                    writeText color true text
+                | LogMessage(text, newLine) | TraceMessage(text, newLine) ->
+                    writeText color newLine text
+
+    /// The default TraceListener for Console.
+    let defaultConsoleTraceListener =
+      ConsoleTraceListener(colorMap)
+
+    /// A List with all registered listeners
+    let listeners = new Collections.Generic.List<ITraceListener>()
+
+    // register listeners
+    listeners.Add defaultConsoleTraceListener
+
+    /// Allows to post messages to all trace listeners
+    let postMessage x = listeners.ForEach(fun listener -> listener.Write x)
+
+    type FAKEException(msg) =
+        inherit System.Exception(msg)
+
+    /// Gets the path of the current FAKE instance
+    #if !CORE_CLR
+    let fakePath = "xxxx" /// typeof<FAKEException>.Assembly.Location
+    #else
+    let fakePath = "xxxx" /// typeof<FAKEException>.GetTypeInfo().Assembly.Location
+    #endif
+
+
+    /// Logs the specified string        
+    let log message = LogMessage(message, true) |> postMessage
+
+    /// Writes a trace to the command line (in green)
+    let trace message = postMessage (TraceMessage(message, true))
+
+    /// Writes a message to the command line (in green)
+    let tracefn fmt = Printf.ksprintf trace fmt
+
+    /// Writes a message to the command line (in green) and without a line break
+    let tracef fmt = Printf.ksprintf (fun text -> postMessage (TraceMessage(text, false))) fmt
+
+    /// Writes a trace to the command line (in yellow)
+    let traceFAKE fmt = Printf.ksprintf (fun text -> postMessage (ImportantMessage text)) fmt
+
+    /// Traces an error (in red)
+    let traceError error = postMessage (ErrorMessage error)
+
+
+
+
+
+//// //// //// //// Runtime/Runners.fs
+
+  /// Contains helper functions which allow to interact with the F# Interactive.
+namespace Fuze.Runtime
+module Runners=
+  open Fuze.Runtime.Environment
+  open Fuze.Runtime.Trace
+  #if NETSTANDARD1_6
+  open System.Runtime.Loader
+  #endif
+
+  open System.Reflection
+  open System
+  open System.IO
+  open System.Diagnostics
+  open System.Threading
+  open System.Text.RegularExpressions
+  // open System.Xml.Linq
+  // open Yaaf.FSharp.Scripting
+
+
+
+  #if !NETSTANDARD1_6
+  type AssemblyLoadContext () =
+    member x.LoadFromAssemblyPath (loc:string) =
+      Reflection.Assembly.LoadFrom(loc)
+    member x.LoadFromAssemblyName(fullname:AssemblyName)=
+      Reflection.Assembly.Load(fullname)
+  #endif
+
+  type AssemblyInfo =
+    { FullName : string
+      Version : string
+      Location : string }
+    static member ofLocation (loc:string) =
+      // let n = // Mono.Cecil.AssemblyDefinition.ReadAssembly(loc).Name
+      // { FullName = n.FullName; Version = n.Version.ToString(); Location = loc }
+      ()
+
+
+  type ScriptCompileOptions =
+    { CompileReferences : string list
+      RuntimeDependencies : AssemblyInfo list
+      AdditionalArguments : string list }
+
+  type FakeConfig =
+    { PrintDetails : bool
+      ScriptFilePath : string
+      CompileOptions : ScriptCompileOptions
+      UseCache : bool
+      Out: TextWriter
+      Err: TextWriter
+      Environment: seq<string * string> }
+
+  let fsiAssemblyName = "removeme"
+  let cachedAssemblyPrefix = "FAKE_CACHE_"
+
+  type ResultCoreCacheInfo =
+    { MaybeCompiledAssembly : string option
+      Warnings : string }
+      member x.AsCacheInfo =
+        match x.MaybeCompiledAssembly with
+        | Some c -> Some { CompiledAssembly = c; Warnings = x.Warnings }
+        | None -> None
+  and CoreCacheInfo =
+    { CompiledAssembly : string
+      Warnings : string }
+      member x.AsResult =
+        { MaybeCompiledAssembly = Some x.CompiledAssembly
+          Warnings = x.Warnings }
+  type FakeContext =
+    { Config : FakeConfig
+      AssemblyContext : AssemblyLoadContext
+      FakeDirectory : string
+      Hash : string }
+      member x.FileName = Path.GetFileNameWithoutExtension x.Config.ScriptFilePath
+      member x.FileNameWithExtension = Path.GetFileName x.Config.ScriptFilePath
+      member x.HashPath = Path.Combine(x.FakeDirectory, x.FileNameWithExtension, x.FileName + "_" + x.Hash)
+      member x.CachedAssemblyFileName = x.FileName + "_" + x.Hash
+      member x.CachedAssemblyFilePath = Path.Combine(x.FakeDirectory, x.FileNameWithExtension, x.CachedAssemblyFileName)
+
+
+
+//// //// //// //// Gulp/gulp.fs
+
+namespace Fuze.Gulp
+
+type GulpContext()=
+    let data="context"
+    do 
+        printfn "Gulp Context"
+
+    member this.pipe endp =
+        printfn "context pipe"
+        this
+
+    member this.src globs =
+        printfn "context src"
+        this
+
+    member this.dest globs =
+        printfn "context dest"
+        this
+
+    member this.task name deps fn =
+        printfn "context task"
+        this
+
+
+type Gulp() =
+    let context=GulpContext()
+    do
+        printfn "%A" context
+
+    member this.src globs  =
+        printfn "gulp.src %A" globs 
+        context.src globs
+    member this.dest globs =
+        printfn "gulp.dest %A" globs 
+        context.dest globs
+    member this.task name deps fn =
+        printfn "gulp.task %s %A %A"  name deps fn
+        context.task name deps fn
+
+module Gulp=
+    printfn "Gulp"
+
+
+
 //// //// //// //// Bootstrap/Main.fs
 
 
 namespace Fuze
+
+
+
+
+
+[<AutoOpen>]
 module Main=
+
+    open Fuze.Gulp
+    
     // [<EntryPoint>]
-    let main (vargs :string[]) = 
+    let main vargs = 
         TracerA.trace vargs
         zlog vargs
         Core.String.productName() |> zlog
         IO.Shell.pwd() |> zlog
         vargs |> zlog
 
+
+        let zgulp=Fuze.Gulp.Gulp()
+        zgulp.task "task0" ["*.fs", "!*.fsx"] ( fun cxt ->
+            printfn "fun %A" cxt 
+
+            zgulp.src(["x"]).pipe(
+                zgulp.dest ["yyy"]
+            )
+
+
+            ()
+            )
+        
         0
 
 
 // printfn ""
+
+
+
+//// //// //// //// fuze.fs
+
+namespace Fuze
+
+[<AutoOpen>]
+module FuzeFuse=
+
+
+    let ztrc = TracerA.trace
+    let testx x =
+        x

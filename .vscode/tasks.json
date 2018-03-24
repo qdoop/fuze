@@ -6,7 +6,7 @@
         {
             "label": "interactiveBuild",
             "type": "shell",
-            "command": "nodemon -e fsx,fs,fsproj   -w tools -w src       --exec   cmd /C tools\\build.cmd",
+            "command": "nodemon -e fsx,fs,fsproj,cmd   -w tools    -w src       --exec   cmd /C tools\\build.cmd",
             "problemMatcher": []
         }
     ]

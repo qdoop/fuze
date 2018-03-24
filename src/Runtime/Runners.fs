@@ -13,8 +13,8 @@ module Runners=
   open System.Diagnostics
   open System.Threading
   open System.Text.RegularExpressions
-  open System.Xml.Linq
-  open Yaaf.FSharp.Scripting
+  // open System.Xml.Linq
+  // open Yaaf.FSharp.Scripting
 
 
 
@@ -31,8 +31,9 @@ module Runners=
       Version : string
       Location : string }
     static member ofLocation (loc:string) =
-      let n = Mono.Cecil.AssemblyDefinition.ReadAssembly(loc).Name
-      { FullName = n.FullName; Version = n.Version.ToString(); Location = loc }
+      // let n = // Mono.Cecil.AssemblyDefinition.ReadAssembly(loc).Name
+      // { FullName = n.FullName; Version = n.Version.ToString(); Location = loc }
+      ()
 
 
   type ScriptCompileOptions =

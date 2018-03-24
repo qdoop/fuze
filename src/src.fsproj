@@ -24,6 +24,7 @@
     <Compile Include="Core/StringBuilder.fs" />
     <Compile Include="Core/SemVer.fs" />
     <Compile Include="Core/Context.fs" />
+    <Compile Include="Core/ReleaseNotes.fs" />
     
 
 
@@ -77,8 +78,8 @@
     <Compile Include="Runtime/Environment.fs" />
     <Compile Include="Runtime/Path.fs" />
     <Compile Include="Runtime/String.fs" />
-    <Compile1 Include="Runtime/Trace.fs" />
-    <Compile1 Include="Runtime/Runners.fs" />
+    <Compile Include="Runtime/Trace.fs" />
+    <Compile Include="Runtime/Runners.fs" />
     <Compile1 Include="Runtime/CompileRunner.fs" />
     <Compile1 Include="Runtime/ScriptRunner.fs" />
     <Compile1 Include="Runtime/FSharpParser.fs" />
@@ -87,7 +88,11 @@
     <Compile1 Include="Runtime/FakeRuntime.fs" />
 
 
+    <Compile Include="Gulp/gulp.fs" />
+
     <Compile Include="Bootstrap/Main.fs" />
+
+    <Compile Include="fuze.fs" />
   </ItemGroup>
 
 </Project>

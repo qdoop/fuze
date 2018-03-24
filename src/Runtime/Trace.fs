@@ -84,9 +84,9 @@ module Trace=
 
     /// Gets the path of the current FAKE instance
     #if !CORE_CLR
-    let fakePath = typeof<FAKEException>.Assembly.Location
+    let fakePath = "xxxx" /// typeof<FAKEException>.Assembly.Location
     #else
-    let fakePath = typeof<FAKEException>.GetTypeInfo().Assembly.Location
+    let fakePath = "xxxx" /// typeof<FAKEException>.GetTypeInfo().Assembly.Location
     #endif
 
 

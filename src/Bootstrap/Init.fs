@@ -4,6 +4,7 @@ namespace Fuze
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
+open System.Linq
 type TracerA() =
     static member trace(  args,
                             [<CallerMemberName>] ?memberName: string,
@@ -11,7 +12,7 @@ type TracerA() =
                             [<CallerLineNumber>] ?line: int            )  =
         match (memberName, path, line) with
         | Some m, Some p, Some l ->
-            printfn "[:%s:%6i] %s( %A )" "fuze.fsscript" l m args
+            printfn "[:%13s:%5i] %s( %A )" (p.ToString().Split('\\').Last()) l m args
         | _,_,_ -> ()
 
 type zlog(args :obj) =
