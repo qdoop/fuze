@@ -6,20 +6,47 @@
   </PropertyGroup>
 
 <!-- 
-     IMPORTANT THIS PROJECT JUST CHECKS INTEGRITY OF THE CODE.
-     AlSO IS USED FROM build_fuze.fsx TO SPECIFY WHICH FILES TO AMALGAMATE AND IN WHAT ORDER
+     __IMPORTANT__ 
+     THIS PROJECT JUST CHECKS INTEGRITY OF THE CODE.
+     AlSO TELLS build_fuze.fsx WHICH FILES TO AMALGAMATE AND IN WHAT ORDER
      DOES NOT PRODUCE ANY OUTPUT
 -->
 
   <ItemGroup>
     <Compile Include="Bootstrap/Init.fs" />
+    
 
     <Compile Include="_ANY/fake.fs" />
     <Compile Include="_ANY/core.fs" />
 
+
     <Compile Include="Core/String.fs" />
     <Compile Include="Core/StringBuilder.fs" />
     <Compile Include="Core/SemVer.fs" />
+    <Compile Include="Core/Context.fs" />
+    
+
+
+    <Compile Include="Environment/Environment.fs" />
+    <Compile Include="Environment/BuildServer.fs" />
+    <Compile Include="Environment/Operators.fs" />
+
+
+    <Compile Include="Core/Xml.fs" />
+
+
+    <Compile Include="Trace/TraceListener.fs" />
+    <Compile Include="Trace/Trace.fs" />
+
+    <Compile Include="Core/TaskRunner.fs" />
+
+
+    <Compile Include="Target/Target.fs" />
+    <Compile Include="Target/TargetOperators.fs" />
+
+
+
+
 
     <Compile Include="Shell/Path.fs" />
     <Compile Include="Shell/FileSystemOperators.fs" />
@@ -33,6 +60,17 @@
     <Compile Include="Shell/Templates.fs" />
     <Compile Include="Shell/Shell.fs"/>
     <Compile Include="Shell/ChangeWatcher.fs"/>
+
+
+    <Compile Include="Process/GuardedAwaitObservable.fs" />
+    <Compile Include="Process/Event.fs" />
+    <Compile Include="Process/Async.fs" />
+    <Compile Include="Process/CmdLineParsing.fs" />
+    <Compile Include="Process/RawProc.fs" />
+    <Compile Include="Process/Proc.fs" />
+    <Compile Include="Process/Process.fs" />
+    <Compile Include="Process/Mono.fs" />
+
 
 
     <Compile Include="Runtime/LegacyApiHelper.fs" />

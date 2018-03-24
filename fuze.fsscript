@@ -1,4 +1,4 @@
-//// Build: 180323T223846.471Z
+//// Build: 180324T005325.394Z
 
 
 
@@ -6,7 +6,7 @@
 
 namespace Fuze
 
-#nowarn "20"
+#nowarn "20" "44"
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
@@ -54,6 +54,11 @@ namespace Fake
 module Core1=
 
     printfn ""
+
+
+
+
+    
 
 
 
@@ -685,6 +690,2157 @@ module SemVer =
         with
         | exn ->
             failwithf "Can't parse \"%s\". %s" version (exn.ToString())
+
+
+
+//// //// //// //// Core/Context.fs
+
+    /// This module tracks the context of the build.
+    /// This allows us to run some modules without any context and change behavior depending on the context
+    /// (For example `Fuze.Process` kills all processes when the Fake Context exists, but it should not when used as library)
+    
+namespace Fuze.Core
+module Context=
+
+    type FakeExecutionContext =
+      { IsCached : bool
+        Context : System.Collections.Concurrent.ConcurrentDictionary<string, obj>
+        ScriptFile : string
+        Arguments : string list }
+        interface System.IDisposable with
+          member x.Dispose () =
+            let l = x.Context.Values |> Seq.toList
+            x.Context.Clear()
+            let rec cleanSeq (s:System.Collections.IEnumerable) =
+              for item in s do
+                match item with
+                | :? System.IDisposable as d -> d.Dispose()
+                | :? System.Collections.IEnumerable as ie -> cleanSeq ie
+                | _ -> ()
+            cleanSeq l
+        static member Create (isCached) scriptFile args =
+          { IsCached = isCached
+            Context = new System.Collections.Concurrent.ConcurrentDictionary<string, obj>()
+            ScriptFile = scriptFile
+            Arguments = args }
+
+    type RuntimeContext =
+      | Fake of FakeExecutionContext
+      | UnknownObj of obj
+      | Unknown
+
+    [<RequireQualifiedAccess>]
+    type internal RuntimeContextWrapper(t: RuntimeContext) =
+    #if !FX_NO_REMOTING
+        inherit System.MarshalByRefObject()
+    #endif
+        member x.Type = t
+
+    #if USE_ASYNC_LOCAL
+    open System.Threading
+    let private fake_data = new AsyncLocal<System.Collections.Concurrent.ConcurrentDictionary<string, obj>>()
+
+    let private getDataDict() =
+      let value = fake_data.Value
+      if isNull value then
+        let l = new System.Collections.Concurrent.ConcurrentDictionary<string, obj>()
+        fake_data.Value <- l
+        l
+      else
+        value  
+      
+
+    #endif
+
+    let private setContext (name:string) (o : obj) : unit =
+    #if USE_ASYNC_LOCAL
+      let d = getDataDict()
+      d.AddOrUpdate(name, o, fun _ old -> o) |> ignore
+    #else
+      System.Runtime.Remoting.Messaging.CallContext.LogicalSetData(name, o)
+    #endif
+
+    let private getContext (name:string) : obj =
+    #if USE_ASYNC_LOCAL
+      let d = getDataDict()
+      match d.TryGetValue(name) with
+      | true, v -> v
+      | false, _ -> null
+    #else
+      System.Runtime.Remoting.Messaging.CallContext.LogicalGetData(name)
+    #endif
+
+    let private fake_ExecutionType = "fake_context_execution_type"
+
+    let getExecutionContext () =
+      match getContext fake_ExecutionType with
+      | null -> RuntimeContext.Unknown
+      | :? RuntimeContextWrapper as e -> e.Type
+      | o -> RuntimeContext.UnknownObj o
+
+    let setExecutionContext (e:RuntimeContext) = setContext fake_ExecutionType (new RuntimeContextWrapper(e))
+
+    let getFakeExecutionContext (e:RuntimeContext) =
+      match e with
+      | RuntimeContext.UnknownObj _
+      | RuntimeContext.Unknown -> None
+      | RuntimeContext.Fake e -> Some e
+
+    let getFakeContext name (f:FakeExecutionContext)  = 
+      match f.Context.TryGetValue(name) with
+      | true, v -> Some v
+      | _ -> None
+    let removeFakeContext name (f:FakeExecutionContext) =
+      match f.Context.TryRemove(name) with
+      | true, v -> Some v
+      | _ -> None
+    let setFakeContext name (v:obj) updateF (f:FakeExecutionContext) =
+      f.Context.AddOrUpdate (name, v, fun _ old -> updateF old)
+
+    let isFakeContext () =
+      getExecutionContext()
+      |> getFakeExecutionContext
+      |> Option.isSome
+
+    let forceFakeContext () =
+      match getExecutionContext() with
+      | RuntimeContext.UnknownObj o ->
+        sprintf "Invalid Fake Execution context was found: Expected '%s' but was '%s'" (typeof<RuntimeContextWrapper>.FullName) (o.GetType().FullName)
+        |> invalidOp
+      | RuntimeContext.Unknown ->
+        invalidOp "no Fake Execution context was found. You can initialize one via Fuze.Core.Context.setExecutionContext"
+      | RuntimeContext.Fake e -> e
+
+    let getFakeVar name =
+      forceFakeContext()
+      |> getFakeContext name
+      |> Option.map (fun o -> o :?> 'a)
+      
+    let removeFakeVar name =
+      forceFakeContext()
+      |> removeFakeContext name
+      |> Option.map (fun o -> o :?> 'a)
+
+    let setFakeVar name (v:'a) =
+      forceFakeContext()
+      |> setFakeContext name v (fun _ -> v :> obj)
+      :?> 'a
+
+    let fakeVar name =
+      (fun () -> getFakeVar name : 'a option),
+      (fun () -> (removeFakeVar name : 'a option) |> ignore),
+      (fun (v : 'a) -> setFakeVar name v |> ignore)
+
+    let fakeVarAllowNoContext name =
+      let mutable varWithoutContext = None
+      (fun () -> 
+        if isFakeContext() then
+          getFakeVar name : 'a option
+        else varWithoutContext),
+      (fun () -> 
+        if isFakeContext() then
+          (removeFakeVar name : 'a option) |> ignore
+        else varWithoutContext <- None),
+      (fun (v : 'a) -> 
+        if isFakeContext() then
+          setFakeVar name v |> ignore
+        else varWithoutContext <- Some v)
+
+
+
+//// //// //// //// Environment/Environment.fs
+
+/// This module contains functions which allow to read and write environment variables and build parameters
+namespace Fuze.SystemHelper
+
+// #if DOTNETCORE
+module Environment =
+    type Environment = System.Environment
+
+    type SpecialFolder =
+        | ApplicationData
+        | UserProfile
+        | LocalApplicationData
+        | ProgramFiles
+        | ProgramFilesX86
+    let GetFolderPath sf =
+        let envVar =
+            match sf with
+            | ApplicationData -> "APPDATA"
+            | UserProfile -> "USERPROFILE"
+            | LocalApplicationData -> "LocalAppData"
+            | ProgramFiles -> "PROGRAMFILES"
+            | ProgramFilesX86 -> "PROGRAMFILES(X86)"
+        
+        let res = Environment.GetEnvironmentVariable(envVar)
+        if System.String.IsNullOrEmpty res && sf = UserProfile then
+            Environment.GetEnvironmentVariable("HOME")
+        else res
+// #endif
+
+namespace Fuze.Core
+
+module Environment =
+// //    type Environment = System.Environment
+// // #if DOTNETCORE
+    open Fuze.SystemHelper
+// // #endif
+
+    open System
+    open System.IO
+    open System.Diagnostics
+    open System.Collections.Generic
+    open System.Text
+    open System.Text.RegularExpressions
+    open System.Reflection
+    open Microsoft.Win32
+
+    /// Type alias for System.EnvironmentVariableTarget
+    // #if !DOTNETCORE
+    // type EnvironTarget = EnvironmentVariableTarget
+    // #endif
+
+    /// Retrieves the environment variable with the given name
+    let environVar name = System.Environment.GetEnvironmentVariable name
+
+    /// Retrieves all environment variables from the given target
+    let environVars () = 
+        let vars = System.Environment.GetEnvironmentVariables ()
+        [ for e in vars -> 
+              let e1 = e :?> Collections.DictionaryEntry
+              e1.Key.ToString(), e1.Value.ToString() ]
+
+    // #if !DOTNETCORE
+    // [<Obsolete("Will be removed in dotnetcore. Use environVars instead.")>]
+    // let environVarsWithMode mode = 
+    //     let vars = System.Environment.GetEnvironmentVariables (mode)
+    //     [ for e in vars -> 
+    //           let e1 = e :?> Collections.DictionaryEntry
+    //           e1.Key, e1.Value ]
+    // #endif
+
+    /// Sets the environment variable with the given name
+    let setEnvironVar name value = System.Environment.SetEnvironmentVariable(name, value)
+
+    /// Clears the environment variable with the given name for the current process.
+    let clearEnvironVar name = System.Environment.SetEnvironmentVariable(name, null)
+
+    [<Obsolete("Use setEnvironVar instead")>]
+    /// Sets the build parameter with the given name for the current process.
+    let setBuildParam name value = setEnvironVar name value
+
+    /// Retrieves the environment variable with the given name or returns the default if no value was set
+    let environVarOrDefault name defaultValue = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then defaultValue
+        else var
+
+    /// Retrieves the environment variable with the given name or fails if not found
+    let environVarOrFail name = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then failwith <| sprintf "Environment variable '%s' not found" name
+        else var
+
+    /// Retrieves the environment variable with the given name or returns the default bool if no value was set
+    let environVarAsBoolOrDefault varName defaultValue =
+        try  
+            (environVar varName).ToUpper() = "TRUE" 
+        with
+        | _ ->  defaultValue
+
+    /// Retrieves the environment variable with the given name or returns the false if no value was set
+    let environVarAsBool varName = environVarAsBoolOrDefault varName false
+
+    /// Retrieves the environment variable or None
+    let environVarOrNone name = 
+        let var = environVar name
+        if String.IsNullOrEmpty var then None
+        else Some var
+
+    /// Splits the entries of an environment variable and removes the empty ones.
+    let splitEnvironVar name =
+        let var = environVarOrNone name
+        if var = None then [ ]
+        else var.Value.Split([| Path.PathSeparator |]) |> Array.toList
+
+    /// Returns if the build parameter with the given name was set
+    let inline hasEnvironVar name = not (isNull (environVar name))
+
+    [<Obsolete("Use hasEnvironVar instead")>]
+    /// Returns if the build parameter with the given name was set
+    let inline hasBuildParam name = hasEnvironVar name
+
+    [<Obsolete("Use environVarOrDefault instead")>]
+    /// Returns the value of the build parameter with the given name if it was set and otherwise the given default value
+    let inline getBuildParamOrDefault name defaultParam = 
+        if hasEnvironVar name then environVar name
+        else defaultParam
+
+    [<Obsolete("Use 'environVarOrDefault name String.Empty' instead")>]
+    /// Returns the value of the build parameter with the given name if it was set and otherwise an empty string
+    let inline getBuildParam name = environVarOrDefault name String.Empty
+
+    /// The path of the "Program Files" folder - might be x64 on x64 machine
+    let ProgramFiles = Environment.GetFolderPath Environment.SpecialFolder.ProgramFiles
+
+    /// The path of Program Files (x86)
+    /// It seems this covers all cases where PROCESSOR\_ARCHITECTURE may misreport and the case where the other variable 
+    /// PROCESSOR\_ARCHITEW6432 can be null
+    let ProgramFilesX86 = 
+        let wow64 = environVar "PROCESSOR_ARCHITEW6432"
+        let globalArch = environVar "PROCESSOR_ARCHITECTURE"
+        match wow64, globalArch with
+        | "AMD64", "AMD64" 
+        | null, "AMD64" 
+        | "x86", "AMD64" -> environVar "ProgramFiles(x86)"
+        | _ -> environVar "ProgramFiles"
+        |> fun detected -> if isNull detected then @"C:\Program Files (x86)\" else detected
+
+    /// The system root environment variable. Typically "C:\Windows"
+    let SystemRoot = environVar "SystemRoot"
+
+    /// Determines if the current system is an Unix system.
+    /// See http://www.mono-project.com/docs/faq/technical/#how-to-detect-the-execution-platform
+    let isUnix = 
+    #if NETSTANDARD1_6
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Linux) || 
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.OSX)
+    #else
+        int System.Environment.OSVersion.Platform |> fun p -> (p = 4) || (p = 6) || (p = 128)
+    #endif
+
+    /// Determines if the current system is a MacOs system
+    let isMacOS =
+    #if NETSTANDARD1_6
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.OSX)
+    #else
+        (System.Environment.OSVersion.Platform = PlatformID.MacOSX) ||
+            // osascript is the AppleScript interpreter on OS X
+            File.Exists "/usr/bin/osascript"
+    #endif
+
+    /// Determines if the current system is a Linux system
+    let isLinux = 
+    #if NETSTANDARD1_6
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Linux)
+    #else
+        isUnix && not isMacOS
+    #endif
+
+    /// Determines if the current system is a Windows system
+    let isWindows =
+    #if NETSTANDARD1_6
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows)
+    #else
+        match System.Environment.OSVersion.Platform with
+        | PlatformID.Win32NT | PlatformID.Win32S | PlatformID.Win32Windows | PlatformID.WinCE -> true
+        | _ -> false
+    #endif
+
+    /// Determines if the current system is a mono system
+    /// Todo: Detect mono on windows
+    let isMono = 
+    #if NETSTANDARD1_6
+        not (isNull (Type.GetType("Mono.Runtime")))
+    #else
+        isUnix
+    #endif
+
+    let isDotNetCore = 
+    #if NETSTANDARD1_6
+        // See https://github.com/dotnet/corefx/blob/master/src/System.Runtime.InteropServices.RuntimeInformation/src/System/Runtime/InteropServices/RuntimeInformation/RuntimeInformation.cs
+        System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription.StartsWith(".NET Core")
+    #else
+        false
+    #endif
+    [<System.Obsolete("Use isDotNetCore instead (different casing of 'N')")>]
+    let isDotnetCore = isDotNetCore
+    
+    module Internal =
+        /// Internal, do not use.
+        /// We use this internally for parsing the output of mono --version
+        let parseMonoDisplayName displayName =
+            let pattern = Regex("\d+(\.\d+)+")
+            let m = pattern.Match(displayName)
+            // NOTE: in System.Version 5.0 >= 5.0.0.0 is false while 5.0.0.0 >= 5.0 is true...
+            let minimizeVersion (v:System.Version) =
+                match v.Minor = 0, v.Revision = 0 with
+                | true, true -> System.Version(v.Major, v.Minor)
+                | _, true -> System.Version(v.Major, v.Minor, v.Build)
+                | _ -> v
+
+            match System.Version.TryParse m.Value with
+            | true, v -> Some (minimizeVersion v)
+            | _ -> None
+
+    /// required sometimes to workaround mono crashes
+    /// http://stackoverflow.com/a/8414517/1269722
+    /// Note: Only given when we are running on mono,
+    /// represents the version of the mono runtime we
+    /// are currently running on.
+    /// In netcore world you can retrieve the mono version in the
+    /// environment (PATH) via Fuze.Core.Process.Mono.monoVersion
+    let monoVersion =
+        let t = Type.GetType("Mono.Runtime")
+        if (not (isNull t)) then
+#if NETSTANDARD1_6
+            let t = t.GetTypeInfo()
+#endif
+            let displayNameMeth = t.GetMethod("GetDisplayName", System.Reflection.BindingFlags.NonPublic ||| System.Reflection.BindingFlags.Static)
+            let displayName = displayNameMeth.Invoke(null, null).ToString()
+            Some (displayName, Internal.parseMonoDisplayName displayName)
+        else None
+
+
+    /// Gets the list of valid directories included in the PATH environment variable.
+    let pathDirectories =
+        splitEnvironVar "PATH"
+        |> Seq.map (fun value -> value.Trim())
+        |> Seq.filter (not << String.IsNullOrEmpty)
+
+    let monoPath =
+        if isMacOS && File.Exists "/Library/Frameworks/Mono.framework/Commands/mono" then
+            "/Library/Frameworks/Mono.framework/Commands/mono"
+        else
+            "mono"
+
+    /// The path of the current target platform
+    let mutable TargetPlatformPrefix = 
+        let (<|>) a b = 
+            match a with
+            | None -> b
+            | _ -> a
+        environVarOrNone "FrameworkDir32" <|> if (String.IsNullOrEmpty SystemRoot) then None
+                                              else Some(Path.Combine(SystemRoot, "Microsoft.NET", "Framework")) 
+        <|> if (isUnix) then Some "/usr/lib/mono"
+            else Some @"C:\Windows\Microsoft.NET\Framework"
+        |> Option.get
+
+    /// Base path for getting tools from windows SDKs
+    let sdkBasePath = Path.Combine(ProgramFilesX86, "Microsoft SDKs", "Windows")
+
+    /// Helper function to help find framework or sdk tools from the 
+    /// newest toolkit available
+    let getNewestTool possibleToolPaths = 
+           possibleToolPaths 
+           |> Seq.sortBy (fun p -> p) 
+           |> Array.ofSeq 
+           |> Array.rev 
+           |> Seq.ofArray 
+           |> Seq.head
+
+    /// Gets the local directory for the given target platform
+    let getTargetPlatformDir platformVersion = 
+        if Directory.Exists(TargetPlatformPrefix + "64") then Path.Combine(TargetPlatformPrefix + "64", platformVersion)
+        else  Path.Combine(TargetPlatformPrefix, platformVersion)
+
+    /// Contains the IO encoding which is given via build parameter "encoding" or the default encoding if no encoding was specified.
+    let getDefaultEncoding() = 
+        match environVarOrDefault "encoding" "default" with
+#if !DOTNETCORE
+        | "default" -> Text.Encoding.Default
+#else
+        | "default" -> Text.Encoding.UTF8
+#endif
+        | enc -> Text.Encoding.GetEncoding(enc)
+
+// #if !DOTNETCORE
+//     [<Obsolete("Will no longer be available in dotnetcore, target package is currently unknown")>]
+//     /// Returns a sequence with all installed .NET framework versions
+//     let getInstalledDotNetFrameworks() = 
+//         let frameworks = new ResizeArray<_>()
+//         try 
+//             let matches = 
+//                 Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\NET Framework Setup\NDP").GetSubKeyNames() 
+//                 |> Seq.filter (fun keyname -> Regex.IsMatch(keyname, @"^v\d"))
+//             for item in matches do
+//                 match item with
+//                 | "v4.0" -> ()
+//                 | "v4" -> 
+//                     let key = @"SOFTWARE\Microsoft\NET Framework Setup\NDP\" + item
+//                     Registry.LocalMachine.OpenSubKey(key).GetSubKeyNames() 
+//                     |> Seq.iter (fun subkey -> 
+//                            let key = @"SOFTWARE\Microsoft\NET Framework Setup\NDP\" + item + @"\" + subkey
+//                            let version = Registry.LocalMachine.OpenSubKey(key).GetValue("Version").ToString()
+//                            frameworks.Add(String.Format("{0} ({1})", version, subkey)))
+//                 | "v1.1.4322" -> frameworks.Add item
+//                 | _ -> 
+//                     let key = @"SOFTWARE\Microsoft\NET Framework Setup\NDP\" + item
+//                     frameworks.Add(Registry.LocalMachine.OpenSubKey(key).GetValue("Version").ToString())
+//             frameworks :> seq<_>
+//         with e -> frameworks :> seq<_> //Probably a new unrecognisable version
+
+//     [<Obsolete("Will no longer be available in dotnetcore, target package is currently unknown")>]
+//     /// A record which allows to display lots of machine specific information like machine name, processor count etc.
+//     type MachineDetails = 
+//         { ProcessorCount : int
+//           Is64bit : bool
+//           OperatingSystem : string
+//           MachineName : string
+//           NETFrameworks : seq<string>
+//           UserDomainName : string
+//           AgentVersion : string
+//           DriveInfo : seq<string> }
+
+//     [<Obsolete("Will no longer be available in dotnetcore, target package is currently unknown")>]
+//     /// Retrieves information about the hard drives
+//     let getDrivesInfo() = 
+//         System.Environment.GetLogicalDrives()
+//         |> Seq.map (fun d -> IO.DriveInfo(d))
+//         |> Seq.filter (fun d -> d.IsReady)
+//         |> Seq.map 
+//                (fun d -> 
+//                sprintf "%s has %0.1fGB free of %0.1fGB" (d.Name.Replace(":\\", "")) 
+//                    (Convert.ToDouble(d.TotalFreeSpace) / (1024. * 1024. * 1024.)) 
+//                    (Convert.ToDouble(d.TotalSize) / (1024. * 1024. * 1024.)))
+
+//     [<Obsolete("Will no longer be available in dotnetcore, target package is currently unknown")>]
+//     /// Retrieves lots of machine specific information like machine name, processor count etc.
+//     let getMachineEnvironment() = 
+//         { ProcessorCount = System.Environment.ProcessorCount
+//           Is64bit = System.Environment.Is64BitOperatingSystem
+//           OperatingSystem = System.Environment.OSVersion.ToString()
+//           MachineName = System.Environment.MachineName
+//           NETFrameworks = getInstalledDotNetFrameworks()
+//           UserDomainName = System.Environment.UserDomainName
+//           AgentVersion = 
+//               sprintf "%A" ((System.Reflection.Assembly.GetAssembly(typedefof<MachineDetails>)).GetName().Version)
+//           DriveInfo = getDrivesInfo() }
+// #endif
+
+
+
+//// //// //// //// Environment/BuildServer.fs
+
+/// Contains functions which allow build scripts to interact with a build server.
+namespace Fuze.Core
+open System
+open Fuze.Core.Environment
+
+open Fuze.SystemHelper
+
+/// The server type option.
+type BuildServer =
+    | TeamFoundation
+    | TeamCity
+    | CCNet
+    | Jenkins
+    | Travis
+    | AppVeyor
+    | GitLabCI
+    | Bamboo
+    | BitbucketPipelines
+    | LocalBuild
+
+/// The trace mode option.
+type TraceMode = 
+    | Console
+    | Xml
+
+[<AbstractClass>]
+type BuildServerInstaller () =
+    abstract member Install : unit -> unit
+    abstract member Detect : unit -> bool
+
+module BuildServer =
+    /// Defines if FAKE will use verbose tracing.
+    /// This flag can be specified by setting the *verbose* build parameter.
+    let mutable verbose = hasEnvironVar "verbose"
+
+    /// A constant label for local builds
+    /// [omit]            
+    let localBuildLabel = "LocalBuild"
+
+    /// Defines the XML output file - used for build servers like CruiseControl.NET.
+    /// This output file can be specified by using the *logfile* build parameter.
+    let mutable xmlOutputFile = environVarOrDefault "logfile" "./output/Results.xml"
+
+    /// Build number retrieved from Bamboo
+    /// [omit]
+    let bambooBuildNumber = environVar "bamboo_buildNumber"
+
+    /// Checks if we are on Bamboo
+    /// [omit]
+    let isBambooBuild =
+        String.IsNullOrEmpty bambooBuildNumber |> not
+
+    /// Checks if we are on Team Foundation
+    /// [omit]
+    let isTFBuild =
+        let tfbuild = environVar "TF_BUILD"
+        not (isNull tfbuild) && tfbuild.ToLowerInvariant() = "true"
+
+    /// Build number retrieved from Team Foundation
+    /// [omit]
+    let tfBuildNumber = environVar "BUILD_BUILDNUMBER"
+
+    /// Build number retrieved from TeamCity
+    /// [omit]
+    let tcBuildNumber = environVar "BUILD_NUMBER"
+
+    /// Build number retrieved from Travis
+    /// [omit]
+    let travisBuildNumber = environVar "TRAVIS_BUILD_NUMBER"
+
+    /// Checks if we are on GitLab CI
+    /// [omit]
+    let isGitlabCI = environVar "CI_SERVER_NAME" = "GitLab CI"
+
+    /// Build number retrieved from GitLab CI
+    /// [omit]
+    let gitlabCIBuildNumber = if isGitlabCI then environVar "CI_BUILD_ID" else ""
+
+    /// Build number retrieved from Jenkins
+    /// [omit]
+    let jenkinsBuildNumber = tcBuildNumber
+
+    /// CruiseControl.NET Build label
+    /// [omit]
+    let ccBuildLabel = environVar "CCNETLABEL"
+
+    /// AppVeyor build number
+    /// [omit]
+    let appVeyorBuildVersion = environVar "APPVEYOR_BUILD_VERSION"
+
+    /// The current build server
+    let buildServer = 
+        if hasEnvironVar "JENKINS_HOME" then Jenkins
+        elif hasEnvironVar "TEAMCITY_VERSION" then TeamCity
+        elif not (String.IsNullOrEmpty ccBuildLabel) then CCNet
+        elif not (String.IsNullOrEmpty travisBuildNumber) then Travis
+        elif not (String.IsNullOrEmpty appVeyorBuildVersion) then AppVeyor
+        elif isGitlabCI then GitLabCI
+        elif isTFBuild then TeamFoundation
+        elif isBambooBuild then Bamboo
+        elif hasEnvironVar "BITBUCKET_COMMIT" then BitbucketPipelines
+        else LocalBuild
+
+    /// The current build version as detected from the current build server.
+    let buildVersion = 
+        let getVersion = environVarOrDefault "buildVersion"
+        match buildServer with
+        | Jenkins -> getVersion jenkinsBuildNumber
+        | TeamCity -> getVersion tcBuildNumber
+        | CCNet -> getVersion ccBuildLabel
+        | Travis -> getVersion travisBuildNumber
+        | AppVeyor -> getVersion appVeyorBuildVersion
+        | GitLabCI -> getVersion gitlabCIBuildNumber
+        | TeamFoundation -> getVersion tfBuildNumber
+        | Bamboo -> getVersion bambooBuildNumber
+        | LocalBuild -> getVersion localBuildLabel
+        | BitbucketPipelines -> getVersion ""
+
+    /// Is true when the current build is a local build.
+    let isLocalBuild = LocalBuild = buildServer
+
+
+    let Install (servers: BuildServerInstaller list) =
+        servers
+        |> List.iter (fun f -> 
+            if f.Detect() then
+                f.Install())
+
+
+
+//open Fuze.Core
+
+//BuildServer.Configure [ TeamCity.Configuration; AppVeyor.Configuration; Travis.Configuration ]
+
+
+
+//// //// //// //// Environment/Operators.fs
+
+namespace Fuze.Core
+
+module Operators =
+    let inline (>!>) func1 func2 x = func1 x; func2 x
+
+
+
+
+//// //// //// //// Core/Xml.fs
+
+    /// Contains functions to read and write XML files.
+namespace Fuze.Core
+module Xml=
+    open Fuze.Core.BuildServer
+    open Fuze.Core
+    open System
+    open System.IO
+    open System.Text
+
+    open System.Xml
+    open System.Xml.XPath
+    #if !NETSTANDARD
+    open System.Xml.Xsl
+    #endif
+
+    /// Reads a value from a XML document using a XPath
+    let Read failOnError (xmlFileName : string) nameSpace prefix xPath =
+        try
+            let document = new XPathDocument(xmlFileName)
+            let navigator = document.CreateNavigator()
+            let manager = new XmlNamespaceManager(navigator.NameTable)
+            if prefix <> "" && nameSpace <> "" then manager.AddNamespace(prefix, nameSpace)
+            let expression = XPathExpression.Compile(xPath, manager)
+            seq {
+                match expression.ReturnType with
+                | XPathResultType.Number | XPathResultType.Boolean | XPathResultType.String ->
+                    yield navigator.Evaluate(expression).ToString()
+                | XPathResultType.NodeSet ->
+                    let nodes = navigator.Select(expression)
+                    while nodes.MoveNext() do
+                        yield nodes.Current.Value
+                | _ -> failwith <| sprintf "XPath-Expression return type %A not implemented" expression.ReturnType
+            }
+        with exn ->
+            if failOnError then failwithf "XMLRead error:\n%s" exn.Message
+            else Seq.empty
+
+    /// Reads a value from a XML document using a XPath
+    /// Returns if the value is an int and the value
+    let Read_Int failOnError xmlFileName nameSpace prefix xPath =
+        let headOrDefault def seq =
+            if Seq.isEmpty seq then def
+            else Seq.head seq
+        Read failOnError xmlFileName nameSpace prefix xPath
+        |> Seq.map Int32.TryParse
+        |> (fun seq ->
+        if failOnError then Seq.head seq
+        else headOrDefault (false, 0) seq)
+
+    /// Creates a XmlWriter which writes to the given file name
+    let Writer(fileName : string) =
+        let writer = XmlWriter.Create(File.OpenWrite(fileName), null)
+        writer.WriteStartDocument()
+        writer
+
+    /// Writes an XML comment to the given XmlTextWriter
+    let Comment comment (writer : XmlWriter) =
+        writer.WriteComment comment
+        writer
+
+    /// Writes an XML start element to the given XmlTextWriter
+    let StartElement name (writer : XmlWriter) =
+        writer.WriteStartElement name
+        writer
+
+    /// Writes an XML end element to the given XmlTextWriter
+    let EndElement(writer : XmlWriter) =
+        writer.WriteEndElement()
+        writer
+
+    /// Writes an XML attribute to current element of the given XmlTextWriter
+    let Attribute name value (writer : XmlWriter) =
+        writer.WriteAttributeString(name, value.ToString())
+        writer
+
+    /// Writes an CData element to the given XmlTextWriter
+    let CDataElement elementName data (writer : XmlWriter) =
+        StartElement elementName writer |> ignore
+        writer.WriteCData data
+        EndElement writer
+
+    /// Gets the attribute with the given name from the given XmlNode
+    let getAttribute (name : string) (node : #XmlNode) =
+        let attribute = node.Attributes.[name]
+        if not (isNull attribute) then attribute.Value else null
+
+    /// Gets a sequence of all child nodes for the given XmlNode
+    let getChilds (node : #XmlNode) =
+        seq {
+            for x in node.ChildNodes -> x
+        }
+
+    /// Gets the first sub node with the given name from the given XmlNode
+    let getSubNode name node =
+        getChilds node
+        |> Seq.filter (fun x -> x.Name = name)
+        |> Seq.head
+
+    /// Parses a XmlNode
+    let parse name f (node : #XmlNode) =
+        if node.Name = name then f node
+        else failwithf "Could not parse %s - Node was %s" name node.Name
+
+    /// Parses a XML subnode
+    let parseSubNode name f = getSubNode name >> parse name f
+
+    /// Loads the given text into a XmlDocument
+    let Doc text =
+        if String.isNullOrEmpty text then null
+        else
+            let xmlDocument = new XmlDocument()
+            xmlDocument.LoadXml text
+            xmlDocument
+
+    /// Gets the DocumentElement of the XmlDocument
+    let DocElement(doc : XmlDocument) = doc.DocumentElement
+
+    /// Replaces text in the XML document specified by a XPath expression.
+    let XPathReplace xpath value (doc : XmlDocument) =
+        let node = doc.SelectSingleNode xpath
+        if node = null then failwithf "XML node '%s' not found" xpath
+        else
+            node.Value <- value
+            doc
+
+    /// Replaces the inner text of an xml node in the XML document specified by a XPath expression.
+    let XPathReplaceInnerText xpath innerTextValue (doc : XmlDocument) =
+        let node = doc.SelectSingleNode xpath
+        if isNull node then failwithf "XML node '%s' not found" xpath
+        else
+            node.InnerText <- innerTextValue
+            doc
+
+    /// Selects a xml node value via XPath from the given document
+    let XPathValue xpath (namespaces : #seq<string * string>) (doc : XmlDocument) =
+        let nsmgr = XmlNamespaceManager(doc.NameTable)
+        namespaces |> Seq.iter nsmgr.AddNamespace
+        let node = doc.DocumentElement.SelectSingleNode(xpath, nsmgr)
+        if node = null then failwithf "XML node '%s' not found" xpath
+        else node.InnerText
+
+    let private load (fileName:string) (doc:XmlDocument) =
+        use fs = File.OpenRead(fileName)
+        doc.Load fs
+    let private save (fileName:string) (doc:XmlDocument) =
+        use fs = File.Open(fileName, FileMode.Truncate, FileAccess.Write)
+        doc.Save fs
+
+    /// Replaces text in a XML file at the location specified by a XPath expression.
+    let Poke (fileName : string) xpath value =
+        let doc = new XmlDocument()
+        XPathReplace xpath value doc |> save fileName
+
+    /// Replaces the inner text of an xml node in a XML file at the location specified by a XPath expression.
+    let PokeInnerText (fileName : string) xpath innerTextValue =
+        let doc = new XmlDocument()
+        load fileName doc
+        XPathReplaceInnerText xpath innerTextValue doc |> save fileName
+
+    /// Replaces text in a XML document specified by a XPath expression, with support for namespaces.
+    let XPathReplaceNS xpath value (namespaces : #seq<string * string>) (doc : XmlDocument) =
+        let nsmgr = XmlNamespaceManager(doc.NameTable)
+        namespaces |> Seq.iter nsmgr.AddNamespace
+        let node = doc.SelectSingleNode(xpath, nsmgr)
+        if node = null then failwithf "XML node '%s' not found" xpath
+        else
+            node.Value <- value
+            doc
+
+    /// Replaces inner text in a XML document specified by a XPath expression, with support for namespaces.
+    let XPathReplaceInnerTextNS xpath innerTextValue (namespaces : #seq<string * string>) (doc : XmlDocument) =
+        let nsmgr = XmlNamespaceManager(doc.NameTable)
+        namespaces |> Seq.iter nsmgr.AddNamespace
+        let node = doc.SelectSingleNode(xpath, nsmgr)
+        if node = null then failwithf "XML node '%s' not found" xpath
+        else
+            node.InnerText <- innerTextValue
+            doc
+
+    /// Replaces text in a XML file at the location specified by a XPath expression, with support for namespaces.
+    let PokeNS (fileName : string) namespaces xpath value =
+        let doc = new XmlDocument()
+        load fileName doc
+        XPathReplaceNS xpath value namespaces doc |> save fileName
+
+    /// Replaces inner text of an xml node in a XML file at the location specified by a XPath expression, with support for namespaces.
+    let PokeInnerTextNS (fileName : string) namespaces xpath innerTextValue =
+        let doc = new XmlDocument()
+        load fileName doc
+        XPathReplaceInnerTextNS xpath innerTextValue namespaces doc |> save fileName
+
+    #if !NETSTANDARD
+    /// Loads the given text into a XslCompiledTransform.
+    [<System.Obsolete("This API is not yet available on netcore. If you have an alternative please switch. If the API becomes available this warning is removed.")>]
+    let XslTransformer text =
+        if String.isNullOrEmpty text then null
+        else
+            let xslCompiledTransform = new XslCompiledTransform()
+            Doc(text) |> xslCompiledTransform.Load
+            xslCompiledTransform
+    /// Transforms a XmlDocument using a XslCompiledTransform.
+    /// ## Parameters
+    ///
+    ///  - `xsl` - The XslCompiledTransform which should be applied.
+    ///  - `doc` - The XmlDocument to transform.
+    [<System.Obsolete("This API is not yet available on netcore. If you have an alternative please switch. If the API becomes available this warning is removed.")>]
+    let XslTransform (xsl : XslCompiledTransform) (doc : XmlDocument) =
+        use memoryStream = new MemoryStream()
+        use textWriter = XmlWriter.Create(memoryStream) // , new UTF8Encoding(false)
+        use writer = System.Xml.XmlWriter.Create(textWriter, xsl.OutputSettings)
+        writer.WriteStartDocument()
+        xsl.Transform(doc, null, writer)
+        let outputDoc = new XmlDocument()
+        let encoding = new UTF8Encoding(false)
+        memoryStream.ToArray()
+        |> encoding.GetString
+        |> outputDoc.LoadXml
+        outputDoc
+
+    /// Transforms a XML file using a XSL stylesheet file.
+    /// ## Parameters
+    ///
+    ///  - `stylesheetUri` - The Uri for the XSL stylesheet file.
+    ///  - `fileName` - The XML file to transform.
+    [<System.Obsolete("This API is not yet available on netcore. If you have an alternative please switch. If the API becomes available this warning is removed.")>]
+    let XmlTransform (stylesheetUri : string) (fileName : string) =
+        let doc = new XmlDocument()
+        doc.Load fileName
+        let xsl = new XslCompiledTransform()
+        xsl.Load stylesheetUri
+        XslTransform xsl doc |> save fileName
+
+    #endif
+
+
+
+//// //// //// //// Trace/TraceListener.fs
+
+/// Defines default listeners for build output traces
+namespace Fuze.Core
+
+open Fuze.Core.BuildServer
+
+open System
+
+[<RequireQualifiedAccess>]
+type KnownTags =
+    | Task of name:string
+    | Target of name:string
+    | Compilation of compiler:string
+    | TestSuite of suiteName:string
+    | Test of testName:string
+    | Other of typeDef:string * name:string
+    member x.Name =
+        match x with
+        | Task n
+        | Target n
+        | Compilation n
+        | TestSuite n
+        | Test n
+        | Other (_, n) -> n
+    member x.Type =
+        match x with
+        | Task _ -> "task"
+        | Target _ -> "target"
+        | Compilation _ -> "compilation"
+        | TestSuite _ -> "testsuite"
+        | Test _ -> "test"
+        | Other (t, _) -> t
+
+[<RequireQualifiedAccess>]
+type DotNetCoverageTool =
+    | DotCover
+    | PartCover
+    | NCover
+    | NCover3
+    override x.ToString() =
+        match x with
+        | DotCover -> "dotcover"
+        | PartCover -> "partcover"
+        | NCover -> "ncover"
+        | NCover3 -> "ncover3"
+
+[<RequireQualifiedAccess>]
+type NunitDataVersion =
+    | Nunit
+    | Nunit3
+
+[<RequireQualifiedAccess>]
+type ImportData =
+    | BuildArtifact
+    | DotNetCoverage of DotNetCoverageTool
+    | DotNetDupFinder
+    | PmdCpd
+    | Pmd
+    | FxCop
+    | ReSharperInspectCode
+    | Jslint
+    | FindBugs
+    | Checkstyle
+    | Gtest
+    | Mstest
+    | Surefire
+    | Junit
+    | Xunit
+    | Nunit of NunitDataVersion
+    member x.Name =
+        match x with
+        | BuildArtifact -> "buildArtifact"
+        | DotNetCoverage _ -> "dotNetCoverage"
+        | DotNetDupFinder -> "DotNetDupFinder"
+        | PmdCpd -> "pmdCpd"
+        | Pmd -> "pmd"
+        | ReSharperInspectCode -> "ReSharperInspectCode"
+        | Jslint -> "jslint"
+        | FindBugs -> "findBugs"
+        | Checkstyle -> "checkstyle"
+        | Gtest -> "gtest"
+        | Mstest -> "mstest"
+        | Surefire -> "surefire"
+        | Junit -> "junit"
+        | FxCop -> "FxCop"
+        | Xunit -> "xunit"
+        | Nunit NunitDataVersion.Nunit -> "nunit"
+        | Nunit NunitDataVersion.Nunit3 -> "nunit3"
+    override x.ToString() =
+        match x with
+        | DotNetCoverage tool -> sprintf "dotNetCoverage (%O)" tool
+        | _ -> x.Name
+
+[<RequireQualifiedAccess>]
+type TestStatus =
+    | Ignored of message:string
+    | Failed of message:string * details:string * expectedActual:(string * string) option
+
+module TestStatus =
+    let inline mapMessage f (t:TestStatus) =
+        match t with
+        | TestStatus.Failed (message, details, Some (expected, actual)) ->
+            TestStatus.Failed (f message, f details, Some (f expected, f actual))
+        | TestStatus.Failed (message, details, None) ->
+            TestStatus.Failed (f message, f details, None)
+        | _ -> t        
+
+
+/// Defines Tracing information for TraceListeners
+[<RequireQualifiedAccess>]
+type TraceData = 
+    | ImportData of typ:ImportData * path:string
+    | BuildNumber of text:string
+    | ImportantMessage of text:string
+    | ErrorMessage of text:string
+    | LogMessage of text:string * newLine:bool
+    | TraceMessage of text:string * newLine:bool
+    | OpenTag of KnownTags * description:string
+    | TestStatus of testName:string * status:TestStatus
+    | TestOutput of testName:string * out:string * err:string
+    | CloseTag of KnownTags * time:TimeSpan
+    member x.NewLine =
+        match x with
+        | ImportantMessage _
+        | ErrorMessage _ -> Some true
+        | LogMessage (_, newLine)
+        | TraceMessage (_, newLine) -> Some newLine
+        | BuildNumber _
+        | TestStatus _
+        | TestOutput _
+        | ImportData _
+        | OpenTag _
+        | CloseTag _ -> None
+    member x.Message =
+        match x with
+        | ImportantMessage text
+        | ErrorMessage text
+        | LogMessage (text, _)
+        | TraceMessage (text, _) -> Some text
+        | BuildNumber _
+        | TestStatus _
+        | TestOutput _
+        | ImportData _
+        | OpenTag _
+        | CloseTag _ -> None
+
+module TraceData =
+    let inline mapMessage f (t:TraceData) =
+        match t with
+        | TraceData.ImportantMessage text -> TraceData.ImportantMessage (f text) 
+        | TraceData.ErrorMessage text -> TraceData.ErrorMessage (f text)
+        | TraceData.LogMessage (text, d) -> TraceData.LogMessage (f text, d)
+        | TraceData.TraceMessage (text, d) -> TraceData.TraceMessage (f text, d)
+        | TraceData.TestStatus (testName,status) -> TraceData.TestStatus(testName, TestStatus.mapMessage f status)
+        | TraceData.TestOutput (testName,out,err) -> TraceData.TestOutput (testName,f out,f err)
+        | _ -> t
+
+    let internal repl (oldStr:string) (repl:string) (s:string) =
+        s.Replace(oldStr, repl)
+    let replace oldString replacement (t:TraceData) =
+        mapMessage (repl oldString replacement) t
+
+/// Defines a TraceListener interface
+type ITraceListener = 
+    abstract Write : TraceData -> unit
+
+module ConsoleWriter =
+    
+    let write toStdErr color newLine text = 
+        let curColor = Console.ForegroundColor
+        try
+          if curColor <> color then Console.ForegroundColor <- color
+          let printer =
+            match toStdErr, newLine with
+            | true, true -> eprintfn
+            | true, false -> eprintf
+            | false, true -> printfn
+            | false, false -> printf
+          printer "%s" text
+        finally
+          if curColor <> color then Console.ForegroundColor <- curColor
+
+    let writeAnsiColor toStdErr color newLine text =
+        let printer =
+            match toStdErr, newLine with
+            | true, true -> eprintfn
+            | true, false -> eprintf
+            | false, true -> printfn
+            | false, false -> printf
+        let colorCode = function
+            | ConsoleColor.Black -> [30]
+            | ConsoleColor.Blue -> [34]
+            | ConsoleColor.Cyan -> [36]
+            | ConsoleColor.Gray -> [37;2]
+            | ConsoleColor.Green -> [32]
+            | ConsoleColor.Magenta -> [35]
+            | ConsoleColor.Red -> [31]
+            | ConsoleColor.White -> [37]
+            | ConsoleColor.Yellow -> [33]
+            | ConsoleColor.DarkBlue -> [34;2]
+            | ConsoleColor.DarkCyan -> [36;2]
+            | ConsoleColor.DarkGray -> [37;2]
+            | ConsoleColor.DarkGreen -> [32;2]
+            | ConsoleColor.DarkMagenta -> [35;2]
+            | ConsoleColor.DarkRed -> [31;2]
+            | ConsoleColor.DarkYellow -> [33;2]
+            | _ -> [39]
+
+        let codeStr =
+            colorCode color
+            |> List.map (sprintf "%i")
+            |> String.concat ";"
+
+        printer "\x1b[%sm%s\x1b[0m" codeStr text
+
+    /// A default color map which maps TracePriorities to ConsoleColors
+    let colorMap traceData = 
+        match traceData with
+        | TraceData.ImportantMessage _ -> ConsoleColor.Yellow
+        | TraceData.ErrorMessage _ -> ConsoleColor.Red
+        | TraceData.LogMessage _ -> ConsoleColor.Gray
+        | TraceData.TraceMessage _ -> ConsoleColor.Green
+        | _ -> ConsoleColor.Gray
+
+/// Implements a TraceListener for System.Console.
+/// ## Parameters
+///  - `importantMessagesToStdErr` - Defines whether to trace important messages to StdErr.
+///  - `colorMap` - A function which maps TracePriorities to ConsoleColors.
+type ConsoleTraceListener(importantMessagesToStdErr, colorMap, ansiColor) =
+    interface ITraceListener with
+        /// Writes the given message to the Console.
+        member __.Write msg = 
+            let color = colorMap msg
+            let write = if ansiColor then ConsoleWriter.writeAnsiColor else ConsoleWriter.write
+            match msg with
+            | TraceData.ImportantMessage text | TraceData.ErrorMessage text ->
+                write importantMessagesToStdErr color true text
+            | TraceData.LogMessage(text, newLine) | TraceData.TraceMessage(text, newLine) ->
+                write false color newLine text
+            | TraceData.OpenTag (tag, descr) ->
+                write false color true (sprintf "Starting %s '%s': %s" tag.Type tag.Name descr)
+            | TraceData.CloseTag (tag, time) ->
+                write false color true (sprintf "Finished '%s' in %O" tag.Name time)
+            | TraceData.ImportData (typ, path) ->
+                write false color true (sprintf "Import data '%O': %s" typ path)
+            | TraceData.TestOutput (test, out, err) ->
+                write false color true (sprintf "Test '%s' output:\n\tOutput: %s\n\tError: %s" test out err)
+            | TraceData.BuildNumber number ->
+                write false color true (sprintf "Build Number: %s" number)
+            | TraceData.TestStatus (test, status) ->
+                write false color true (sprintf "Test '%s' status: %A" test status)
+
+
+type TraceSecret =
+    { Value : string; Replacement : string }
+
+module TraceSecrets =
+    let private traceSecretsVar = "Fuze.Core.Trace.TraceSecrets"
+    let private getTraceSecrets, _, (setTraceSecrets:TraceSecret list -> unit) = 
+        Fuze.Core.Context.fakeVar traceSecretsVar
+
+    let getAll () =
+        match getTraceSecrets() with
+        | Some secrets -> secrets
+        | None -> []
+
+    let register replacement secret =
+        setTraceSecrets ({ Value = secret; Replacement = replacement } :: getAll() |> List.filter (fun s -> s.Value <> secret))
+
+    let guardMessage (s:string) =
+        getAll()
+        |> Seq.fold (fun state secret -> TraceData.repl secret.Value secret.Replacement state) s
+
+module CoreTracing =
+    // If we write the stderr on those build servers the build will fail.
+    let importantMessagesToStdErr = buildServer <> CCNet && buildServer <> AppVeyor && buildServer <> TeamCity && buildServer <> TeamFoundation
+
+    /// The default TraceListener for Console.
+    let defaultConsoleTraceListener  =
+      ConsoleTraceListener(importantMessagesToStdErr, ConsoleWriter.colorMap, false) :> ITraceListener
+
+
+    /// A List with all registered listeners
+
+    let private traceListenersVar = "Fuze.Core.Trace.TraceListeners"
+    let private getTraceListeners, _, (setTraceListenersPrivate:ITraceListener list -> unit) = 
+        Fuze.Core.Context.fakeVar traceListenersVar
+
+    let areListenersSet () =
+        match getTraceListeners() with
+        | None -> false
+        | Some _ -> true
+
+
+    // register listeners
+    let getListeners () =
+        match getTraceListeners() with
+        | None -> [defaultConsoleTraceListener]
+        | Some t -> t
+
+    let setTraceListeners l = setTraceListenersPrivate l
+    let addListener l = setTraceListenersPrivate (l :: getListeners())
+
+    /// Allows to post messages to all trace listeners
+    let postMessage x =
+        let msg =
+            TraceSecrets.getAll()
+            |> Seq.fold (fun state secret -> TraceData.replace secret.Value secret.Replacement state) x
+
+        getListeners() |> Seq.iter (fun listener -> listener.Write msg)
+
+
+
+//// //// //// //// Trace/Trace.fs
+
+    /// This module contains function which allow to trace build output
+    
+namespace  Fuze.Core 
+module Trace=
+
+    open Fuze.Core
+    open Fuze.Core.Environment
+    open Fuze.Core.BuildServer
+
+    open System
+    open System.Reflection
+    open System.Threading
+
+    type FAKEException(msg) =
+        inherit System.Exception(msg)
+
+
+    let private openTags = new ThreadLocal<list<System.Diagnostics.Stopwatch * KnownTags>>(fun _ -> [])
+
+    /// Logs the specified string        
+    let log message = TraceData.LogMessage(message, true) |> CoreTracing.postMessage
+
+    /// Logs the specified message
+    let logfn fmt = Printf.ksprintf log fmt
+
+    /// Logs the specified message (without line break)
+    let logf fmt = Printf.ksprintf (fun text -> CoreTracing.postMessage (TraceData.LogMessage(text, false))) fmt
+
+    /// Logs the specified string if the verbose mode is activated.
+    let logVerbosefn fmt = 
+        Printf.ksprintf (if verbose then log
+                         else ignore) fmt
+
+    /// Writes a trace to the command line (in green)
+    let trace message = CoreTracing.postMessage (TraceData.TraceMessage(message, true))
+
+    /// Writes a message to the command line (in green)
+    let tracefn fmt = Printf.ksprintf trace fmt
+
+    /// Writes a message to the command line (in green) and without a line break
+    let tracef fmt = Printf.ksprintf (fun text -> CoreTracing.postMessage (TraceData.TraceMessage(text, false))) fmt
+
+    /// Writes a trace to the command line (in green) if the verbose mode is activated.
+    let traceVerbose s = 
+        if verbose then trace s
+
+    /// Writes a trace to stderr (in yellow)  
+    let traceImportant text = CoreTracing.postMessage (TraceData.ImportantMessage text)
+
+    /// Writes a trace to the command line (in yellow)
+    let traceFAKE fmt = Printf.ksprintf (TraceData.ImportantMessage >> CoreTracing.postMessage) fmt
+
+    /// Traces an error (in red)
+    let traceError error = CoreTracing.postMessage (TraceData.ErrorMessage error)
+
+    open Microsoft.FSharp.Core.Printf
+
+    /// Converts an exception and its inner exceptions to a nice string.
+    let exceptionAndInnersToString (ex:Exception) =
+        let sb = Text.StringBuilder()
+        let delimeter = String.replicate 50 "*"
+        let nl = Environment.NewLine
+        let rec printException (e:Exception) count =
+            if (e :? TargetException && not (isNull e.InnerException))
+            then printException (e.InnerException) count
+            else
+                if (count = 1) then bprintf sb "Exception Message:%s%s%s" e.Message nl delimeter
+                else bprintf sb "%s%s%d)Exception Message:%s%s%s" nl nl count e.Message nl delimeter
+                bprintf sb "%sType: %s" nl (e.GetType().FullName)
+                // Loop through the public properties of the exception object
+                // and record their values.
+                e.GetType().GetTypeInfo().GetProperties()
+                |> Array.iter (fun p ->
+                    // Do not log information for the InnerException or StackTrace.
+                    // This information is captured later in the process.
+                    if (p.Name <> "InnerException" && p.Name <> "StackTrace" &&
+                        p.Name <> "Message" && p.Name <> "Data") then
+                        try
+                            let value = p.GetValue(e, null)
+                            if (not (isNull value))
+                            then bprintf sb "%s%s: %s" nl p.Name (value.ToString())
+                        with
+                        | e2 -> bprintf sb "%s%s: %s" nl p.Name e2.Message
+                )
+                if not (isNull e.StackTrace) then
+                    bprintf sb "%s%sStackTrace%s%s%s" nl nl nl delimeter nl
+                    bprintf sb "%s%s" nl e.StackTrace
+                if not (isNull e.InnerException)
+                then printException e.InnerException (count+1)
+        printException ex 1
+        sb.ToString()
+
+    /// Traces an exception details (in red)
+    let traceException (ex:Exception) = exceptionAndInnersToString ex |> traceError
+
+    /// Traces the EnvironmentVariables
+    let TraceEnvironmentVariables() = 
+    #if !DOTNETCORE
+        // [ EnvironTarget.Machine; EnvironTarget.Process; EnvironTarget.User ] 
+        // |> Seq.iter (fun mode -> 
+        //        tracefn "Environment-Settings (%A):" mode
+        //        environVars mode |> Seq.iter (tracefn "  %A"))
+        tracefn "Environment-Settings :\n" 
+        environVars () |> Seq.iter (fun (a,b) ->
+            tracefn "  %A - %A" a b 
+        )
+
+    #else
+        tracefn "Environment-Settings (%A):" "Process"
+        environVars () |> Seq.iter (tracefn "  %A")
+    #endif
+
+    /// Traces a line
+    let traceLine() = trace "---------------------------------------------------------------------"
+
+    /// Traces a header
+    let traceHeader name = 
+        trace ""
+        traceLine()
+        trace name
+        traceLine()
+
+    /// Puts an opening tag on the internal tag stack
+    let openTagUnsafe tag description =
+        let sw = System.Diagnostics.Stopwatch.StartNew()
+        openTags.Value <- (sw, tag) :: openTags.Value
+        TraceData.OpenTag(tag, description) |> CoreTracing.postMessage
+
+    let private asSafeDisposable f =
+        let mutable isDisposed = false
+        { new System.IDisposable with
+            member __.Dispose () =
+                if not isDisposed then
+                  isDisposed <- true
+                  f() }
+
+    /// Puts an opening tag on the internal tag stack
+    [<System.Obsolete("Consider using traceTag instead and 'use' to properly call closeTag in case of exceptions. To remove this warning use 'openTagUnsafe'.")>]
+    let openTag tag description = openTagUnsafe tag description
+
+    /// Removes an opening tag from the internal tag stack
+    let closeTagUnsafe tag =
+        let time =
+            match openTags.Value with
+            | (sw, x) :: rest when x = tag -> 
+                openTags.Value <- rest
+                sw.Elapsed
+            | _ -> failwithf "Invalid tag structure. Trying to close %A tag but stack is %A" tag openTags
+        TraceData.CloseTag (tag, time) |> CoreTracing.postMessage
+
+    /// Removes an opening tag from the internal tag stack
+    [<System.Obsolete("Consider using traceTag instead and 'use' to properly call closeTag in case of exceptions. To remove this warning use 'closeTagUnsafe'.")>]
+    let closeTag tag = closeTagUnsafe tag
+
+    let traceTag tag description =
+        openTagUnsafe tag description
+        asSafeDisposable (fun () -> closeTagUnsafe tag)
+
+
+    let testStatus testName testStatus =
+        // TODO: Check if the given test is opened in openTags-stack?
+        TraceData.TestStatus (testName, testStatus) |> CoreTracing.postMessage
+
+    let testOutput testName out err =
+        // TODO: Check if the given test is opened in openTags-stack?
+        TraceData.TestOutput (testName, out, err) |> CoreTracing.postMessage
+
+    let publish typ path =
+        TraceData.ImportData (typ, path) |> CoreTracing.postMessage
+    let setBuildNumber number =
+        TraceData.BuildNumber number |> CoreTracing.postMessage
+
+    let closeAllOpenTags() = Seq.iter (fun (_, tag) -> closeTagUnsafe tag) openTags.Value
+
+    /// Traces the begin of a target
+    let traceStartTargetUnsafe name description dependencyString =
+        openTagUnsafe (KnownTags.Target name) description
+        if not (isNull description) then tracefn "  %s" description
+
+    /// Traces the begin of a target
+    [<System.Obsolete("Consider using traceTarget instead and 'use' to properly call traceEndTask in case of exceptions. To remove this warning use 'traceStartTargetUnsafe'.")>]
+    let traceStartTarget name description dependencyString =
+        traceStartTargetUnsafe name description dependencyString
+
+    /// Traces the end of a target
+    let traceEndTargetUnsafe name = 
+        closeTagUnsafe (KnownTags.Target name)
+
+    /// Traces the end of a target
+    [<System.Obsolete("Consider using traceTarget instead and 'use' to properly call traceEndTask in case of exceptions. To remove this warning use 'traceEndTargetUnsafe'.")>]
+    let traceEndTarget name = traceEndTargetUnsafe name
+
+    let traceTarget name description dependencyString =
+        traceStartTargetUnsafe name description dependencyString
+        asSafeDisposable (fun () -> traceEndTargetUnsafe name)
+
+    /// Traces the begin of a task
+    let traceStartTaskUnsafe task description = 
+        openTagUnsafe (KnownTags.Task task) description
+
+    /// Traces the begin of a task
+    [<System.Obsolete("Consider using traceTask instead and 'use' to properly call traceEndTask in case of exceptions. To remove this warning use 'traceStartTaskUnsafe'.")>]
+    let traceStartTask task description = traceStartTaskUnsafe task description
+
+    /// Traces the end of a task
+    let traceEndTaskUnsafe task = 
+        closeTagUnsafe (KnownTags.Task task)
+       
+    /// Traces the end of a task
+    [<System.Obsolete("Consider using traceTask instead and 'use' to properly call traceEndTask in case of exceptions. To remove this warning use 'traceEndTask'.")>]
+    let traceEndTask task = traceEndTaskUnsafe task
+         
+    let traceTask name description =
+        traceStartTaskUnsafe name description
+        asSafeDisposable (fun _ -> traceEndTaskUnsafe name)
+
+    open System.Diagnostics
+    #if DOTNETCORE
+    type EventLogEntryType =
+      | Error
+      | Information
+      | Warning
+      | Other
+    #endif
+    /// Traces the message to the console
+    let logToConsole (msg, eventLogEntry : EventLogEntryType) =
+        let safeMessage = TraceSecrets.guardMessage msg
+        match eventLogEntry with
+        | EventLogEntryType.Error -> TraceData.ErrorMessage safeMessage
+        | EventLogEntryType.Information -> TraceData.TraceMessage(safeMessage, true)
+        | EventLogEntryType.Warning -> TraceData.ImportantMessage safeMessage
+        | _ -> TraceData.LogMessage(safeMessage, true)
+        |> CoreTracing.defaultConsoleTraceListener.Write
+
+    /// Logs the given files with the message.
+    let Log message files = files |> Seq.iter (log << sprintf "%s%s" message)
+
+
+
+//// //// //// //// Core/TaskRunner.fs
+
+    /// Contains a helper which can be used to implement timeouts and retries.
+namespace Fuze.Core
+module TaskRunner=
+
+    open Fuze.Core
+
+    /// Waits until the given function returns true or the timeout is reached.
+    /// ## Parameters
+    ///
+    ///  - `f` - This function will be started.
+    ///  - `timeout` - A System.TimeSpan representing the timeout.
+    ///  - `testMS` - An interval at which FAKE checks if the function has succeeded.
+    ///  - `timeoutF` - This function will be run if the timeout has been reached.
+    let waitFor f timeout (testMS : int) timeoutF =
+        let watch = new System.Diagnostics.Stopwatch()
+        watch.Start()
+        while f() |> not do
+            if watch.Elapsed > timeout then timeoutF()
+            System.Threading.Thread.Sleep testMS
+        watch.Elapsed
+
+    /// Retries the given function until a retry limit is reached or the function succeeds without exception.
+    /// ## Parameters
+    ///
+    ///  - `f` - This function will be started.
+    ///  - `retries` - A retry limit.
+    let rec runWithRetries f retries =
+        if retries <= 0 then f()
+        else
+            try
+                f()
+            with exn ->
+                Trace.trace (sprintf "Task failed with %s" exn.Message)
+                Trace.trace ("Retry.")
+                runWithRetries f (retries - 1)
+
+
+
+//// //// //// //// Target/Target.fs
+
+namespace Fuze.Core
+
+open System
+open System.Collections.Generic
+open Fuze.Core
+
+/// [omit]
+type TargetDescription = string
+
+type TargetResult =
+    { Error : exn option; Time : TimeSpan; Target : Target; WasSkipped : bool }
+
+and TargetContext =
+    { PreviousTargets : TargetResult list }
+    static member Empty = { PreviousTargets = [] }
+    member x.HasError =
+        x.PreviousTargets
+        |> List.exists (fun t -> t.Error.IsSome)
+    member x.TryFindPrevious name =
+        x.PreviousTargets |> List.tryFind (fun t -> t.Target.Name = name)        
+
+and TargetParameter =
+    { TargetInfo : Target
+      Context : TargetContext }
+
+/// [omit]
+and Target =
+    { Name: string;
+      Dependencies: string list;
+      SoftDependencies: string list;
+      Description: TargetDescription option;
+      Function : TargetParameter -> unit}
+
+/// Exception for request errors
+#if !NETSTANDARD1_6
+[<System.Serializable>]
+#endif
+type BuildFailedException =
+    val private info : TargetContext option
+    inherit Exception
+    new (msg:string, inner:exn) = {
+      inherit Exception(msg, inner)
+      info = None }
+    new (info:TargetContext, msg:string, inner:exn) = {
+      inherit Exception(msg, inner)
+      info = Some info }
+#if !NETSTANDARD1_6
+    new (info:System.Runtime.Serialization.SerializationInfo, context:System.Runtime.Serialization.StreamingContext) = {
+      inherit Exception(info, context)
+      info = None
+    }
+#endif
+    member x.Info with get () = x.info
+    member x.Wrap() =
+        match x.info with
+        | Some info ->
+            BuildFailedException(info, x.Message, x:>exn)
+        | None ->
+            BuildFailedException(x.Message, x:>exn)
+
+module Target =
+
+    type private DependencyType =
+        | Hard = 1
+        | Soft = 2
+
+    /// [omit]
+    //let mutable PrintStackTraceOnError = false
+    let private printStackTraceOnErrorVar = "Fuze.Core.Target.PrintStackTraceOnError"
+    let private getPrintStackTraceOnError, _, (setPrintStackTraceOnError:bool -> unit) = 
+        Fuze.Core.Context.fakeVar printStackTraceOnErrorVar
+    
+    /// [omit]
+    //let mutable LastDescription = null
+    let private lastDescriptionVar = "Fuze.Core.Target.LastDescription"
+    let private getLastDescription, removeLastDescription, setLastDescription = 
+        Fuze.Core.Context.fakeVar lastDescriptionVar
+
+    /// Sets the Description for the next target.
+    /// [omit]
+    let Description text =
+        match getLastDescription() with
+        | Some (v:string) ->
+            failwithf "You can't set the description for a target twice. There is already a description: %A" v
+        | None ->
+           setLastDescription text
+
+    /// TargetDictionary
+    /// [omit]
+    let internal getVarWithInit name f =
+        let varName = sprintf "Fuze.Core.Target.%s" name
+        let getVar, _, setVar = 
+            Fuze.Core.Context.fakeVar varName
+        fun () ->
+            match getVar() with
+            | Some d -> d
+            | None ->
+                let d = f () // new Dictionary<_,_>(StringComparer.OrdinalIgnoreCase)
+                setVar d
+                d
+            
+    let internal getTargetDict =
+        getVarWithInit "TargetDict" (fun () -> new Dictionary<_,_>(StringComparer.OrdinalIgnoreCase))
+
+    /// Final Targets - stores final targets and if they are activated.
+    let internal getFinalTargets =
+        getVarWithInit "FinalTargets" (fun () -> new Dictionary<_,_>(StringComparer.OrdinalIgnoreCase))
+
+    /// BuildFailureTargets - stores build failure targets and if they are activated.
+    let internal getBuildFailureTargets =
+        getVarWithInit "BuildFailureTargets" (fun () -> new Dictionary<_,_>(StringComparer.OrdinalIgnoreCase))
+
+
+    /// Resets the state so that a deployment can be invoked multiple times
+    /// [omit]
+    let internal reset() =
+        getTargetDict().Clear()
+        getBuildFailureTargets().Clear()
+        getFinalTargets().Clear()
+
+    /// Returns a list with all target names.
+    let internal getAllTargetsNames() = getTargetDict() |> Seq.map (fun t -> t.Key) |> Seq.toList
+
+    /// Gets a target with the given name from the target dictionary.
+    let Get name =
+        let d = getTargetDict()
+        match d.TryGetValue (name) with
+        | true, target -> target
+        | _  ->
+            Trace.traceError <| sprintf "Target \"%s\" is not defined. Existing targets:" name
+            for target in d do
+                Trace.traceError  <| sprintf "  - %s" target.Value.Name
+            failwithf "Target \"%s\" is not defined." name
+    
+    let internal runSimple context target =
+        let name = target.Name
+        let watch = System.Diagnostics.Stopwatch.StartNew()
+        let error =
+            try
+                target.Function { TargetInfo = target; Context = context }
+                None
+            with e -> Some e
+        watch.Stop()
+        { Error = error; Time = watch.Elapsed; Target = target; WasSkipped = false }
+    let internal runSimpleContext target context =
+        let result = runSimple context target
+        { context with PreviousTargets = context.PreviousTargets @ [result] }
+
+
+    /// This simply runs the function of a target without doing anything (like tracing, stopwatching or adding it to the results at the end)
+    let RunSimple name =
+        Get name
+        |> runSimple TargetContext.Empty
+
+    /// Returns the DependencyString for the given target.
+    let internal dependencyString target =
+        if target.Dependencies.IsEmpty then String.Empty else
+        target.Dependencies
+          |> Seq.map (fun d -> (Get d).Name)
+          |> String.separated ", "
+          |> sprintf "(==> %s)"
+
+    /// Returns the soft  DependencyString for the given target.
+    let internal softDependencyString target =
+        if target.SoftDependencies.IsEmpty then String.Empty else
+        target.SoftDependencies
+          |> Seq.map (fun d -> (Get d).Name)
+          |> String.separated ", "
+          |> sprintf "(?=> %s)"
+
+    /// Do nothing - Can be used to define empty targets.
+    let DoNothing = (fun (_:TargetParameter) -> ())
+
+    /// Checks whether the dependency (soft or normal) can be added.
+    /// [omit]
+    let internal checkIfDependencyCanBeAddedCore fGetDependencies targetName dependentTargetName =
+        let target = Get targetName
+        let dependentTarget = Get dependentTargetName
+
+        let rec checkDependencies dependentTarget =
+              fGetDependencies dependentTarget
+              |> List.iter (fun dep ->
+                   if String.toLower dep = String.toLower targetName then
+                      failwithf "Cyclic dependency between %s and %s" targetName dependentTarget.Name
+                   checkDependencies (Get dep))
+
+        checkDependencies dependentTarget
+        target,dependentTarget
+
+    /// Checks whether the dependency can be added.
+    /// [omit]
+    let internal checkIfDependencyCanBeAdded targetName dependentTargetName =
+       checkIfDependencyCanBeAddedCore (fun target -> target.Dependencies) targetName dependentTargetName
+
+    /// Checks whether the soft dependency can be added.
+    /// [omit]
+    let internal checkIfSoftDependencyCanBeAdded targetName dependentTargetName =
+       checkIfDependencyCanBeAddedCore (fun target -> target.SoftDependencies) targetName dependentTargetName
+
+    /// Adds the dependency to the front of the list of dependencies.
+    /// [omit]
+    let internal dependencyAtFront targetName dependentTargetName =
+        let target,dependentTarget = checkIfDependencyCanBeAdded targetName dependentTargetName
+
+        getTargetDict().[targetName] <- { target with Dependencies = dependentTargetName :: target.Dependencies }
+
+    /// Appends the dependency to the list of dependencies.
+    /// [omit]
+    let internal dependencyAtEnd targetName dependentTargetName =
+        let target,dependentTarget = checkIfDependencyCanBeAdded targetName dependentTargetName
+
+        getTargetDict().[targetName] <- { target with Dependencies = target.Dependencies @ [dependentTargetName] }
+
+
+    /// Appends the dependency to the list of soft dependencies.
+    /// [omit]
+    let internal softDependencyAtEnd targetName dependentTargetName =
+        let target,dependentTarget = checkIfDependencyCanBeAdded targetName dependentTargetName
+
+        getTargetDict().[targetName] <- { target with SoftDependencies = target.SoftDependencies @ [dependentTargetName] }
+
+    /// Adds the dependency to the list of dependencies.
+    /// [omit]
+    let internal dependency targetName dependentTargetName = dependencyAtEnd targetName dependentTargetName
+
+    /// Adds the dependency to the list of soft dependencies.
+    /// [omit]
+    let internal softDependency targetName dependentTargetName = softDependencyAtEnd targetName dependentTargetName
+
+    /// Adds the dependencies to the list of dependencies.
+    /// [omit]
+    let internal Dependencies targetName dependentTargetNames = dependentTargetNames |> List.iter (dependency targetName)
+
+    /// Adds the dependencies to the list of soft dependencies.
+    /// [omit]
+    let internal SoftDependencies targetName dependentTargetNames = dependentTargetNames |> List.iter (softDependency targetName)
+
+    /// Backwards dependencies operator - x is dependent on ys.
+    let inline internal (<==) x ys = Dependencies x ys
+
+    /// Creates a target from template.
+    /// [omit]
+    let internal addTarget target name =
+        getTargetDict().Add(name, target)
+        name <== target.Dependencies
+        removeLastDescription()
+        
+    /// add a target with dependencies
+    /// [omit]
+    let internal addTargetWithDependencies dependencies body name =
+        let template =
+            { Name = name
+              Dependencies = dependencies
+              SoftDependencies = []
+              Description = getLastDescription()
+              Function = body }
+        addTarget template name
+
+    /// Creates a Target.
+    let Create name body = addTargetWithDependencies [] body name
+
+    /// Runs all activated final targets (in alphabetically order).
+    /// [omit]
+    let internal runFinalTargets context =
+        getFinalTargets()
+          |> Seq.filter (fun kv -> kv.Value)     // only if activated
+          |> Seq.map (fun kv -> kv.Key)
+          |> Seq.fold (fun context name ->
+               Trace.tracefn "Starting FinalTarget: %s" name
+               let target = Get name
+               runSimpleContext target context) context  
+
+    /// Runs all build failure targets.
+    /// [omit]
+    let internal runBuildFailureTargets (context) =
+        getBuildFailureTargets()
+          |> Seq.filter (fun kv -> kv.Value)     // only if activated
+          |> Seq.map (fun kv -> kv.Key)
+          |> Seq.fold (fun context name ->
+               Trace.tracefn "Starting BuildFailureTarget: %s" name
+               let target = Get name
+               runSimpleContext target context) context
+
+    /// List all targets available.
+    let ListAvailable() =
+        Trace.log "The following targets are available:"
+        for t in getTargetDict().Values do
+            Trace.logfn "   %s%s" t.Name (match t.Description with Some s -> sprintf " - %s" s | _ -> "")
+
+
+    // Maps the specified dependency type into the list of targets
+    let private withDependencyType (depType:DependencyType) targets =
+        targets |> List.map (fun t -> depType, t)
+
+    // Helper function for visiting targets in a dependency tree. Returns a set containing the names of the all the
+    // visited targets, and a list containing the targets visited ordered such that dependencies of a target appear earlier
+    // in the list than the target.
+    let private visitDependencies fVisit targetName =
+        let visit fGetDependencies fVisit targetName =
+            let visited = new HashSet<_>()
+            let ordered = new List<_>()
+            let rec visitDependenciesAux level (depType,targetName) =
+                let target = Get targetName
+                let isVisited = visited.Contains targetName
+                visited.Add targetName |> ignore
+                fVisit (target, depType, level, isVisited)
+                (fGetDependencies target) |> Seq.iter (visitDependenciesAux (level + 1))
+                if not isVisited then ordered.Add targetName
+            visitDependenciesAux 0 (DependencyType.Hard, targetName)
+            visited, ordered
+
+        // First pass is to accumulate targets in (hard) dependency graph
+        let visited, _ = visit (fun t -> t.Dependencies |> withDependencyType DependencyType.Hard) ignore targetName
+
+        let getAllDependencies (t: Target) =
+             (t.Dependencies |> withDependencyType DependencyType.Hard) @
+             // Note that we only include the soft dependency if it is present in the set of targets that were
+             // visited.
+             (t.SoftDependencies |> List.filter visited.Contains |> withDependencyType DependencyType.Soft)
+
+        // Now make second pass, adding in soft depencencies if appropriate
+        visit getAllDependencies fVisit targetName
+
+    /// <summary>Writes a dependency graph.</summary>
+    /// <param name="verbose">Whether to print verbose output or not.</param>
+    /// <param name="target">The target for which the dependencies should be printed.</param>
+    let PrintDependencyGraph verbose target =
+        match getTargetDict().TryGetValue (target) with
+        | false,_ -> ListAvailable()
+        | true,target ->
+            Trace.logfn "%sDependencyGraph for Target %s:" (if verbose then String.Empty else "Shortened ") target.Name
+
+            let logDependency ((t: Target), depType, level, isVisited) =
+                if verbose ||  not isVisited then
+                    let indent = (String(' ', level * 3))
+                    if depType = DependencyType.Soft then
+                        Trace.log <| sprintf "%s<=? %s" indent t.Name
+                    else
+                        Trace.log <| sprintf "%s<== %s" indent t.Name
+
+            let _, ordered = visitDependencies logDependency target.Name
+
+            Trace.log ""
+            Trace.log "The resulting target order is:"
+            Seq.iter (Trace.logfn " - %s") ordered
+
+    /// <summary>Writes a build time report.</summary>
+    /// <param name="total">The total runtime.</param>
+    let internal WriteTaskTimeSummary total context =
+        Trace.traceHeader "Build Time Report"
+        let executedTargets = context.PreviousTargets        
+        if executedTargets.Length > 0 then
+            let width =
+                executedTargets
+                  |> Seq.map (fun (tres) -> tres.Target.Name.Length)
+                  |> Seq.max
+                  |> max 8
+
+            let alignedString (name:string) (duration) extra =
+                let durString = sprintf "%O" duration
+                if (String.IsNullOrEmpty extra) then
+                    sprintf "%s   %s" (name.PadRight width) durString
+                else sprintf "%s   %s   (%s)" (name.PadRight width) (durString.PadRight "00:00:00.0000824".Length) extra
+            let aligned (name:string) duration extra = alignedString name duration extra |> Trace.trace
+            let alignedWarn (name:string) duration extra = alignedString name duration extra |> Trace.traceFAKE "%s"
+            let alignedError (name:string) duration extra = alignedString name duration extra |> Trace.traceError
+
+            aligned "Target" "Duration" null
+            aligned "------" "--------" null
+            executedTargets
+              |> Seq.iter (fun (tres) ->
+                    let name = tres.Target.Name
+                    let time = tres.Time
+                    match tres.Error with
+                    | None when tres.WasSkipped -> alignedWarn name time "skipped" // Yellow
+                    | None -> aligned name time null
+                    | Some e -> alignedError name time e.Message)
+
+            aligned "Total:" total null
+            if not context.HasError then aligned "Status:" "Ok" null
+            else
+                alignedError "Status:" "Failure" null
+        else
+            Trace.traceError "No target was successfully completed"
+
+        Trace.traceLine()
+
+    /// [omit]
+    let internal isListMode = Environment.hasEnvironVar "list"
+
+    // Instead of the target can be used the list dependencies graph parameter.
+    let internal doesTargetMeanListTargets target = target = "--listTargets"  || target = "-lt"
+
+
+    /// Determines a parallel build order for the given set of targets
+    let internal determineBuildOrder (target : string) =
+
+        let t = Get target
+
+        let targetLevels = new Dictionary<_,_>()
+        let addTargetLevel ((target: Target), _, level, _ ) =
+            match targetLevels.TryGetValue target.Name with
+            | true, mapLevel when mapLevel >= level -> ()
+            | _ -> targetLevels.[target.Name] <- level
+
+        let visited, ordered = visitDependencies addTargetLevel target
+
+        // the results are grouped by their level, sorted descending (by level) and
+        // finally grouped together in a list<TargetTemplate<unit>[]>
+        let result =
+            targetLevels
+            |> Seq.map (fun pair -> pair.Key, pair.Value)
+            |> Seq.groupBy snd
+            |> Seq.sortBy (fun (l,_) -> -l)
+            |> Seq.map (snd >> Seq.map fst >> Seq.distinct >> Seq.map Get >> Seq.toArray)
+            |> Seq.toList
+
+        // Note that this build order cannot be considered "optimal"
+        // since it may introduce order where actually no dependencies
+        // exist. However it yields a "good" execution order in practice.
+        result
+
+    /// Runs a single target without its dependencies... only when no error has been detected yet.
+    let internal runSingleTarget (target : Target) (context:TargetContext) =
+        if not context.HasError then
+            use t = Trace.traceTarget target.Name (match target.Description with Some d -> d | _ -> "NoDescription") (dependencyString target)
+            runSimpleContext target context
+        else
+            { context with PreviousTargets = context.PreviousTargets @ [{ Error = None; Time = TimeSpan.Zero; Target = target; WasSkipped = true }] }
+
+
+    /// Runs the given array of targets in parallel using count tasks
+    let internal runTargetsParallel (count : int) (targets : Target[]) context =
+        let known =
+            context.PreviousTargets
+            |> Seq.map (fun tres -> tres.Target.Name, tres)
+            |> dict
+        let filterKnown targets =
+            targets
+            |> List.filter (fun tres -> not (known.ContainsKey tres.Target.Name))
+        targets
+        |> Array.map (fun t -> async { return runSingleTarget t context })
+        |> Async.Parallel
+        |> Async.RunSynchronously
+        |> Seq.reduce (fun ctx1 ctx2 ->
+            { PreviousTargets = 
+                context.PreviousTargets @ filterKnown ctx1.PreviousTargets @ filterKnown ctx2.PreviousTargets })
+
+    /// Runs a target and its dependencies.
+    let internal run targetName =
+        if doesTargetMeanListTargets targetName then ListAvailable(); TargetContext.Empty else
+        match getLastDescription() with
+        | Some d -> failwithf "You set a task description (%A) but didn't specify a task. Make sure to set the Description above the Target." d
+        | None -> ()
+
+        let rec runTargets (targets: Target array) (context:TargetContext) =
+            let lastTarget = targets |> Array.last
+            //if not context.HasErrors && context.TryFindPrevious(lastTarget.Name).IsNone then
+            if Environment.hasEnvironVar "single-target" then
+                Trace.traceImportant "Single target mode ==> Skipping dependencies."
+                runSingleTarget lastTarget context
+            else
+               targets |> Array.fold (fun context target -> runSingleTarget target context) context
+           // else                
+
+        printfn "run %s" targetName
+        let watch = new System.Diagnostics.Stopwatch()
+        watch.Start()
+        let context = TargetContext.Empty
+        let context =
+            Trace.tracefn "Building project with version: %s" BuildServer.buildVersion
+            let parallelJobs = Environment.environVarOrDefault "parallel-jobs" "1" |> int
+
+            // Figure out the order in in which targets can be run, and which can be run in parallel.
+            if parallelJobs > 1 then
+                Trace.tracefn "Running parallel build with %d workers" parallelJobs
+
+                // determine a parallel build order
+                let order = determineBuildOrder targetName
+
+                // run every level in parallel
+                order
+                    |> Seq.fold (fun context par -> runTargetsParallel parallelJobs par context) context
+            else
+                // single threaded build.
+                PrintDependencyGraph false targetName
+
+                // Note: we could use the ordering resulting from flattening the result of determineBuildOrder
+                // for a single threaded build (thereby centralizing the algorithm for build order), but that
+                // ordering is inconsistent with earlier versions of FAKE (and PrintDependencyGraph).
+                let _, ordered = visitDependencies ignore targetName
+
+                runTargets (ordered |> Seq.map Get |> Seq.toArray) context
+
+        let context =        
+            if context.HasError then
+                runBuildFailureTargets context
+            else context            
+        let context = runFinalTargets context
+        WriteTaskTimeSummary watch.Elapsed context
+        
+        if context.HasError then
+            let errorTargets =
+                context.PreviousTargets
+                |> List.choose (fun tres ->
+                    match tres.Error with
+                    | Some er -> Some (er, tres.Target)
+                    | None -> None)
+            let targets = errorTargets |> Seq.map (fun (er, target) -> target.Name) |> Seq.distinct
+            let targetStr = String.Join(", ", targets)
+            let errorMsg =
+                if errorTargets.Length = 1 then
+                    sprintf "Target '%s' failed." targetStr
+                else
+                    sprintf "Targets '%s' failed." targetStr          
+            let inner = AggregateException(AggregateException().Message, errorTargets |> Seq.map fst)
+            BuildFailedException(context, errorMsg, inner)                
+            |> raise
+
+        context
+
+    /// Creates a target in case of build failure (not activated).
+    let CreateBuildFailure name body =
+        Create name body
+        getBuildFailureTargets().Add(name,false)
+
+    /// Activates the build failure target.
+    let ActivateBuildFailure name =
+        let t = Get name // test if target is defined
+        getBuildFailureTargets().[name] <- true
+
+    /// Creates a final target (not activated).
+    let CreateFinal name body =
+        Create name body
+        getFinalTargets().Add(name,false)
+
+    /// Activates the final target.
+    let ActivateFinal name =
+        let t = Get name // test if target is defined
+        getFinalTargets().[name] <- true
+
+    /// Runs a target and its dependencies, used for testing - usually not called in scripts.
+    let RunAndGetContext targetName = run targetName
+
+    /// Runs a target and its dependencies
+    let Run targetName = run targetName |> ignore
+
+    /// Runs the target given by the target parameter or the given default target
+    let RunOrDefault defaultTarget = Environment.environVarOrDefault "target" defaultTarget |> Run
+
+    /// Runs the target given by the target parameter or lists the available targets
+    let RunOrList() =
+        if Environment.hasEnvironVar "target" then Environment.environVar "target" |> Run
+        else ListAvailable()
+
+
+
+//// //// //// //// Target/TargetOperators.fs
+
+    /// Provides functions and operators to deal with FAKE targets and target dependencies.
+    
+namespace Fuze.Core
+module TargetOperators=
+
+    open Fuze.Core
+    open Fuze.Core.Target
+    open System.Collections.Generic
+
+    /// Allows to use Tokens instead of strings
+    let (?) f s = f s
+
+    /// Allows to use Tokens instead of strings for TargetNames
+    let (?<-) f str action = f str action
+
+    let (<==) x y = x <== y
+
+    // Allows to use For? syntax for Dependencies
+    // I have no idea, remove and wait for people to complain
+    //let For x y = x <== y
+
+    // Converts a dependency into a list
+    // I have no idea, remove and wait for people to complain
+    //let Dependency x = [x]
+
+    // Appends the dependency to the list of dependencies
+    // I have no idea, remove and wait for people to complain
+    //let And x y = y @ [x]
+
+
+    /// Stores which targets are on the same level
+    let private sameLevels = 
+        getVarWithInit "sameLevels" (fun () -> new Dictionary<_,_>(System.StringComparer.OrdinalIgnoreCase))
+            
+
+    /// Specifies that two targets are on the same level of execution
+    let internal targetsAreOnSameLevel x y =
+        match sameLevels().TryGetValue y with
+        | true, z -> ()
+        | _  -> sameLevels().[y] <- x
+
+    /// Specifies that two targets have the same dependencies
+    let rec internal addDependenciesOnSameLevel target dependency =
+        match sameLevels().TryGetValue dependency with
+        | true, x -> 
+            addDependenciesOnSameLevel target x
+            Dependencies target [x]
+        | _  -> ()
+
+    /// Specifies that two targets have the same dependencies
+    let rec internal addSoftDependenciesOnSameLevel target dependency =
+        match sameLevels().TryGetValue dependency with
+        | true, x -> 
+            addSoftDependenciesOnSameLevel target x
+            SoftDependencies target [x]
+        | _  -> ()
+
+
+    /// Defines a dependency - y is dependent on x
+    let (==>) x y =
+        addDependenciesOnSameLevel y x 
+        Dependencies y [x]
+        y
+
+
+    /// Defines a soft dependency. x must run before y, if it is present, but y does not require x to be run.
+    let (?=>) x y = 
+       addSoftDependenciesOnSameLevel y x 
+       SoftDependencies y [x]
+       y
+
+    /// Defines a soft dependency. x must run before y, if it is present, but y does not require x to be run.
+    let (<=?) y x = x ?=> y
+
+
+    /// Defines that x and y are not dependent on each other but y is dependent on all dependencies of x.
+    let (<=>) x y =   
+        let target_x = Get x
+        Dependencies y target_x.Dependencies
+        targetsAreOnSameLevel x y
+        y
+
+    /// Defines a conditional dependency - y is dependent on x if the condition is true
+    let (=?>) x (y,condition) = if condition then x ==> y else x
 
 
 
@@ -2138,6 +4294,1877 @@ module ChangeWatcher=
 
 
     let Run (onChange : FileChange seq -> unit) (fileIncludes : IGlobbingPattern) = RunWithOptions { IncludeSubdirectories = true } onChange fileIncludes
+
+
+
+//// //// //// //// Process/GuardedAwaitObservable.fs
+
+
+
+namespace Fuze.Core
+module internal GuardedAwaitObservable=
+
+    // from https://github.com/fsprojects/fsharpx/blob/f99a8f669ab49166c854c479d17c3add2b39f8d7/src/FSharpx.Core/Observable.fs
+    // TODO: reference FSharpx.Async once it supports netstandard...
+    open System
+    open System.Threading
+
+    /// Helper that can be used for writing CPS-style code that resumes
+    /// on the same thread where the operation was started.
+    let private synchronize f = 
+        let ctx = System.Threading.SynchronizationContext.Current
+        f (fun g -> 
+            let nctx = System.Threading.SynchronizationContext.Current
+            if not (isNull ctx) && ctx <> nctx then ctx.Post((fun _ -> g()), null)
+            else g())
+
+    type Microsoft.FSharp.Control.Async with
+        /// Behaves like AwaitObservable, but calls the specified guarding function
+        /// after a subscriber is registered with the observable.
+        static member GuardedAwaitObservable (ev1 : IObservable<'T1>) guardFunction = 
+            let removeObj : IDisposable option ref = ref None
+            let removeLock = new obj()
+            let setRemover r = lock removeLock (fun () -> removeObj := Some r)
+            
+            let remove() = 
+                lock removeLock (fun () -> 
+                    match !removeObj with
+                    | Some d -> 
+                        removeObj := None
+                        d.Dispose()
+                    | None -> ())
+            synchronize (fun f -> 
+                let workflow = 
+                    Async.FromContinuations((fun (cont, econt, ccont) -> 
+                        let rec finish cont value = 
+                            remove()
+                            f (fun () -> cont value)
+                        setRemover <| ev1.Subscribe({ new IObserver<_> with
+                                                          member __.OnNext(v) = finish cont v
+                                                          member __.OnError(e) = finish econt e
+                                                          member __.OnCompleted() = 
+                                                              let msg = 
+                                                                  "Cancelling the workflow, because the Observable awaited using AwaitObservable has completed."
+                                                              finish ccont (new System.OperationCanceledException(msg)) })
+                        guardFunction()))
+                async { 
+                    let! cToken = Async.CancellationToken
+                    let token : CancellationToken = cToken
+                    use registration = token.Register(fun () -> remove())
+                    return! workflow
+                })
+
+
+
+//// //// //// //// Process/Event.fs
+
+namespace Fuze.Core.ProcessHelpers
+
+module internal Event =
+    /// Executes f just after adding the event-handler
+    let guard f (e:IEvent<'Del, 'Args>) = 
+        let e = Event.map id e
+        { new IEvent<'Args> with 
+            member x.AddHandler(d) = e.AddHandler(d); f()
+            member x.RemoveHandler(d) = e.RemoveHandler(d)
+            member x.Subscribe(observer) = 
+              let rm = e.Subscribe(observer) in f(); rm }
+
+
+
+//// //// //// //// Process/Async.fs
+
+namespace Fuze.Core.ProcessHelpers
+
+module internal Async = 
+    let lift f =
+        f >> async.Return
+    let bind f a =
+        async.Bind(a, f)
+    let map f a =
+        bind (lift f) a
+
+
+[<AutoOpen>]
+module internal AsyncExtensions =
+    open System.Threading
+    open System.Threading.Tasks
+
+    type internal VolatileBarrier() =
+        [<VolatileField>]
+        let mutable isStopped = false
+        member __.Proceed = not isStopped
+        member __.Stop() = isStopped <- true
+    open System
+    // This uses a trick to get the underlying OperationCanceledException
+    let inline internal getCancelledException (completedTask:Task) (waitWithAwaiter) =
+        let fallback = new TaskCanceledException(completedTask) :> OperationCanceledException
+        // sadly there is no other public api to retrieve it, but to call .GetAwaiter().GetResult().
+        try waitWithAwaiter()
+            // should not happen, but just in case...
+            fallback
+        with
+        | :? OperationCanceledException as o -> o
+        | other ->
+            // shouldn't happen, but just in case...
+            new TaskCanceledException(fallback.Message, other) :> OperationCanceledException
+    let inline internal startCatchCancellation(work, cancellationToken) =
+            Async.FromContinuations(fun (cont, econt, _) ->
+              // When the child is cancelled, report OperationCancelled
+              // as an ordinary exception to "error continuation" rather
+              // than using "cancellation continuation"
+              let ccont e = econt e
+              // Start the workflow using a provided cancellation token
+              Async.StartWithContinuations( work, cont, econt, ccont,
+                                            ?cancellationToken=cancellationToken) )
+    let inline internal startAsTaskHelper start computation cancellationToken taskCreationOptions =
+        let token = defaultArg cancellationToken Async.DefaultCancellationToken
+        let taskCreationOptions = defaultArg taskCreationOptions TaskCreationOptions.None
+        let tcs = new TaskCompletionSource<_>(taskCreationOptions)
+
+        let a =
+            async {
+                try
+                    // To ensure we don't cancel this very async (which is required to properly forward the error condition)
+                    let! result = startCatchCancellation(computation, Some token)
+                    do
+                        tcs.SetResult(result)
+                with exn ->
+                    tcs.SetException(exn)
+            }
+        start(a)
+        tcs.Task
+    type Async with
+        static member StartCatchCancellation(work, ?cancellationToken) =
+            startCatchCancellation (work, cancellationToken)
+
+        /// Like StartAsTask but gives the computation time to so some regular cancellation work
+        static member StartAsTaskProperCancel (computation : Async<_>, ?taskCreationOptions, ?cancellationToken:CancellationToken) : Task<_> =
+            startAsTaskHelper Async.Start computation cancellationToken taskCreationOptions 
+
+        static member StartImmediateAsTask (computation,?taskCreationOptions,?cancellationToken) =
+            startAsTaskHelper Async.StartImmediate computation cancellationToken taskCreationOptions 
+
+        static member AwaitTaskWithoutAggregate (task:Task<'T>) : Async<'T> =
+            Async.FromContinuations(fun (cont, econt, ccont) ->
+                let continuation (completedTask : Task<_>) =
+                    if completedTask.IsCanceled then
+                        let cancelledException =
+                            getCancelledException completedTask (fun () -> completedTask.GetAwaiter().GetResult() |> ignore)
+                        econt (cancelledException)
+                    elif completedTask.IsFaulted then
+                        if completedTask.Exception.InnerExceptions.Count = 1 then
+                            econt completedTask.Exception.InnerExceptions.[0]
+                        else
+                            econt completedTask.Exception
+                    else
+                        cont completedTask.Result
+                task.ContinueWith(Action<Task<'T>>(continuation)) |> ignore)
+        static member AwaitTaskWithoutAggregate (task:Task) : Async<unit> =
+            Async.FromContinuations(fun (cont, econt, ccont) ->
+                let continuation (completedTask : Task) =
+                    if completedTask.IsCanceled then
+                        let cancelledException =
+                            getCancelledException completedTask (fun () -> completedTask.GetAwaiter().GetResult() |> ignore)
+                        econt (cancelledException)
+                    elif completedTask.IsFaulted then
+                        if completedTask.Exception.InnerExceptions.Count = 1 then
+                            econt completedTask.Exception.InnerExceptions.[0]
+                        else
+                            econt completedTask.Exception
+                    else
+                        cont ()
+                task.ContinueWith(Action<Task>(continuation)) |> ignore)
+
+    type Microsoft.FSharp.Control.AsyncBuilder with
+      /// An extension method that overloads the standard 'Bind' of the 'async' builder. The new overload awaits on
+      /// a standard .NET task
+      member x.Bind(t : Task<'T>, f:'T -> Async<'R>) : Async<'R> =
+        async.Bind(Async.AwaitTaskWithoutAggregate t, f)
+
+      /// An extension method that overloads the standard 'Bind' of the 'async' builder. The new overload awaits on
+      /// a standard .NET task which does not commpute a value
+      member x.Bind(t : Task, f : unit -> Async<'R>) : Async<'R> =
+        async.Bind(Async.AwaitTaskWithoutAggregate t, f)
+
+
+
+//// //// //// //// Process/CmdLineParsing.fs
+
+namespace Fuze.Core
+
+module internal CmdLineParsing =
+    let escapeCommandLineForShell (cmdLine:string) =
+        sprintf "'%s'" (cmdLine.Replace("'", "'\\''"))
+    let windowsArgvToCommandLine args =
+        let escapeBackslashes (sb:System.Text.StringBuilder) (s:string) (lastSearchIndex:int) =
+            // Backslashes must be escaped if and only if they precede a double quote.
+            [ lastSearchIndex .. -1 .. 0]
+            |> Seq.takeWhile (fun i -> s.[i] = '\\')
+            //|> Seq.map (fun c -> )
+            //|> fun c -> Seq.replicate c '\\'
+            |> Seq.iter (fun c -> sb.Append '\\' |> ignore)
+        
+        let sb = new System.Text.StringBuilder()
+        for (s:string) in args do
+            sb.Append('"') |> ignore
+            // Escape double quotes (") and backslashes (\).
+            let mutable searchIndex = 0
+            
+            // Put this test first to support zero length strings.
+            let mutable quoteIndex = 0
+            while searchIndex < s.Length && quoteIndex >= 0 do
+
+                quoteIndex <- s.IndexOf('"', searchIndex)
+                if quoteIndex >= 0 then
+                    sb.Append(s, searchIndex, quoteIndex - searchIndex) |> ignore
+                    escapeBackslashes sb s (quoteIndex - 1)
+                    sb.Append('\\') |> ignore
+                    sb.Append('"') |> ignore
+                    searchIndex <- quoteIndex + 1
+            
+            sb.Append(s, searchIndex, s.Length - searchIndex) |> ignore
+            escapeBackslashes sb s (s.Length - 1)
+            sb.Append(@""" ") |> ignore
+        
+        sb.ToString(0, System.Math.Max(0, sb.Length - 1))
+
+    let windowsCommandLineToArgv (arguments:string) =
+        // https://github.com/dotnet/corefx/blob/master/src/System.Diagnostics.Process/src/System/Diagnostics/Process.Unix.cs#L443-L522
+        let currentArgument = new System.Text.StringBuilder()
+        let mutable inQuotes = false
+        let results = System.Collections.Generic.List<_>()
+
+        // Iterate through all of the characters in the argument string.
+        let mutable i = 0
+        while i < arguments.Length do
+            // From the current position, iterate through contiguous backslashes.
+            let mutable backslashCount = 0
+            while i < arguments.Length && arguments.[i] = '\\' do
+                i <- i + 1
+                backslashCount <- backslashCount + 1
+            if backslashCount > 0 then
+                if i > arguments.Length || arguments.[i] <> '"' then
+                    // Backslashes not followed by a double quote:
+                    // they should all be treated as literal backslashes.
+                    currentArgument.Append('\\', backslashCount) |> ignore
+                    i <- i - 1
+                else
+                    // Backslashes followed by a double quote:
+                    // - Output a literal slash for each complete pair of slashes
+                    // - If one remains, use it to make the subsequent quote a literal.
+                    currentArgument.Append('\\', backslashCount / 2) |> ignore
+                    if backslashCount % 2 = 0 then
+                        i <- i - 1
+                    else
+                        currentArgument.Append('"') |> ignore
+            else
+                let c = arguments.[i]
+                
+                match c with
+                // If this is a double quote, track whether we're inside of quotes or not.
+                // Anything within quotes will be treated as a single argument, even if
+                // it contains spaces.
+                | '"' ->
+                    inQuotes <-  not inQuotes
+                // If this is a space/tab and we're not in quotes, we're done with the current
+                // argument, and if we've built up any characters in the current argument,
+                // it should be added to the results and then reset for the next one.
+                | ' ' | '\t' when not inQuotes ->
+                    if currentArgument.Length > 0 then
+                        results.Add(currentArgument.ToString())
+                        currentArgument.Clear() |> ignore
+                // Nothing special; add the character to the current argument.
+                | _ ->
+                    currentArgument.Append(c) |> ignore
+            i <- i + 1
+
+        // If we reach the end of the string and we still have anything in our current
+        // argument buffer, treat it as an argument to be added to the results.
+        if currentArgument.Length > 0 then
+            results.Add(currentArgument.ToString())
+
+        results.ToArray()
+
+    let toProcessStartInfo args =
+        let cmd = windowsArgvToCommandLine args
+        if Environment.isMono && Environment.isLinux then
+            // See https://bugzilla.xamarin.com/show_bug.cgi?id=19296
+            cmd.Replace("\\$", "\\\\$").Replace("\\`", "\\\\`")
+        else cmd
+
+type FilePath = string
+type Arguments = 
+    { Args : string array }
+    static member Empty = { Args = [||] }
+    /// See https://msdn.microsoft.com/en-us/library/17w5ykft.aspx
+    static member OfWindowsCommandLine cmd =
+        { Args = CmdLineParsing.windowsCommandLineToArgv cmd }
+    /// This is the reverse of https://msdn.microsoft.com/en-us/library/17w5ykft.aspx
+    member x.ToWindowsCommandLine = CmdLineParsing.windowsArgvToCommandLine x.Args
+    member x.ToLinuxShellCommandLine =
+        System.String.Join(" ", x.Args |> Seq.map CmdLineParsing.escapeCommandLineForShell)
+    static member OfArgs args = { Args = args }
+    static member OfStartInfo cmd =
+        Arguments.OfWindowsCommandLine cmd
+    member internal x.ToStartInfo = CmdLineParsing.toProcessStartInfo x.Args
+
+
+
+//// //// //// //// Process/RawProc.fs
+
+namespace Fuze.Core
+
+open System.Reflection
+open Fuze.Core.ProcessHelpers
+
+type Command =
+    | ShellCommand of string
+    /// Windows: https://msdn.microsoft.com/en-us/library/windows/desktop/bb776391(v=vs.85).aspx
+    /// Linux(mono): https://github.com/mono/mono/blob/0bcbe39b148bb498742fc68416f8293ccd350fb6/eglib/src/gshell.c#L32-L104 (because we need to create a commandline string internally which need to go through that code)
+    /// Linux(netcore): See https://github.com/fsharp/FAKE/pull/1281/commits/285e585ec459ac7b89ca4897d1323c5a5b7e4558 and https://github.com/dotnet/corefx/blob/master/src/System.Diagnostics.Process/src/System/Diagnostics/Process.Unix.cs#L443-L522
+    | RawCommand of executable:FilePath * arguments:Arguments
+
+type DataRef<'T> =
+    internal { retrieveRaw : (unit -> 'T) ref }
+    static member Empty =
+        { retrieveRaw = ref (fun _ -> invalidOp "Can retrieve only when a process has been started!") } : DataRef<'T>
+    static member Map f (inner:DataRef<'T>) =
+        { retrieveRaw = ref (fun _ -> f inner.Value) }
+    member x.Value = (!x.retrieveRaw)()
+
+type StreamRef = DataRef<System.IO.Stream>
+//type DataRef =
+//    static member Empty<'T> = DataRef
+type StreamSpecification =
+    | Inherit
+    | UseStream of closeOnExit:bool * stream:System.IO.Stream
+    | CreatePipe of StreamRef // The underlying framework creates pipes already
+
+type ProcessOutput = { Output : string; Error : string }
+
+type RawCreateProcess =
+    internal {
+        Command : Command
+        WorkingDirectory : string option
+        Environment : (string * string) list option
+        StandardInput : StreamSpecification 
+        StandardOutput : StreamSpecification 
+        StandardError : StreamSpecification
+        GetRawOutput : (unit -> ProcessOutput) option
+    }
+    member internal x.ToStartInfo =
+        let p = new System.Diagnostics.ProcessStartInfo()
+        match x.Command with
+        | ShellCommand s ->
+            p.UseShellExecute <- true
+            p.FileName <- s
+            p.Arguments <- null
+        | RawCommand (filename, args) ->
+            p.UseShellExecute <- false
+            p.FileName <- filename
+            p.Arguments <- args.ToStartInfo
+        match x.StandardInput with
+        | Inherit ->
+            p.RedirectStandardInput <- false
+        | UseStream _ | CreatePipe _ ->
+            p.RedirectStandardInput <- true
+        match x.StandardOutput with
+        | Inherit ->
+            p.RedirectStandardOutput <- false
+        | UseStream _ | CreatePipe _ ->
+            p.RedirectStandardOutput <- true
+        match x.StandardError with
+        | Inherit ->
+            p.RedirectStandardError <- false
+        | UseStream _ | CreatePipe _ ->
+            p.RedirectStandardError <- true
+                
+        let setEnv key var =
+            p.Environment.[key] <- var
+        x.Environment
+            |> Option.iter (fun env ->
+                p.Environment.Clear()
+                env |> Seq.iter (fun (key, value) -> setEnv key value))
+#if FX_WINDOWSTLE    
+        p.WindowStyle <- System.Diagnostics.ProcessWindowStyle.Hidden
+#endif
+        p
+
+    member x.OutputRedirected = x.GetRawOutput.IsSome
+    member x.CommandLine =
+        match x.Command with
+        | ShellCommand s -> s
+        | RawCommand (f, arg) -> sprintf "%s %s" f arg.ToWindowsCommandLine
+
+type IProcessStarter =
+    abstract Start : RawCreateProcess -> Async<int * ProcessOutput option>
+
+module RawProc =
+    // mono sets echo off for some reason, therefore interactive mode doesn't work as expected
+    // this enables this tty feature which makes the interactive mode work as expected
+    let private setEcho (b:bool) =
+        // See https://github.com/mono/mono/blob/master/mcs/class/corlib/System/ConsoleDriver.cs#L289
+        let t = System.Type.GetType("System.ConsoleDriver").GetTypeInfo()
+        if Environment.isMono then
+            let flags = System.Reflection.BindingFlags.Static ||| System.Reflection.BindingFlags.NonPublic
+            if isNull t then
+                Trace.traceFAKE "Expected to find System.ConsoleDriver.SetEcho"
+                false
+            else
+                let setEchoMethod = t.GetMethod("SetEcho", flags)
+                if isNull setEchoMethod then
+                    Trace.traceFAKE "Expected to find System.ConsoleDriver.SetEcho"
+                    false
+                else
+                    setEchoMethod.Invoke(null, [| b :> obj |]) :?> bool
+        else false
+        
+    open System.Diagnostics
+    open System.IO
+    let mutable processStarter = 
+        { new IProcessStarter with
+            member x.Start c = async {
+                let p = c.ToStartInfo
+                let commandLine = 
+                    sprintf "%s> \"%s\" %s" p.WorkingDirectory p.FileName p.Arguments
+
+                Trace.tracefn "%s... RedirectInput: %b, RedirectOutput: %b, RedirectError: %b" commandLine p.RedirectStandardInput p.RedirectStandardOutput p.RedirectStandardError
+                
+                use toolProcess = new Process(StartInfo = p)
+                
+                let isStarted = ref false
+                let mutable readOutputTask = System.Threading.Tasks.Task.FromResult Stream.Null
+                let mutable readErrorTask = System.Threading.Tasks.Task.FromResult Stream.Null
+                let mutable redirectStdInTask = System.Threading.Tasks.Task.FromResult Stream.Null
+                let tok = new System.Threading.CancellationTokenSource()
+                let start() =
+                    if not <| !isStarted then
+                        toolProcess.EnableRaisingEvents <- true
+                        setEcho true |> ignore
+                        if not <| toolProcess.Start() then
+                            failwithf "could not start process: %s" commandLine
+                        isStarted := true
+                        
+                        let handleStream parameter processStream isInputStream =
+                            async {
+                                match parameter with
+                                | Inherit ->
+                                    return failwithf "Unexpected value"
+                                | UseStream (shouldClose, stream) ->
+                                    if isInputStream then
+                                        do! stream.CopyToAsync(processStream, 81920, tok.Token)
+                                            |> Async.AwaitTask
+                                    else
+                                        do! processStream.CopyToAsync(stream, 81920, tok.Token)
+                                            |> Async.AwaitTask
+                                    return
+                                        if shouldClose then stream else Stream.Null
+                                | CreatePipe (r) ->
+                                    r.retrieveRaw := fun _ -> processStream
+                                    return Stream.Null
+                            }
+        
+                        if p.RedirectStandardInput then
+                            redirectStdInTask <-
+                              handleStream c.StandardInput toolProcess.StandardInput.BaseStream true
+                              // Immediate makes sure we set the ref cell before we return...
+                              |> fun a -> Async.StartImmediateAsTask(a, cancellationToken = tok.Token)
+                              
+                        if p.RedirectStandardOutput then
+                            readOutputTask <-
+                              handleStream c.StandardOutput toolProcess.StandardOutput.BaseStream false
+                              // Immediate makes sure we set the ref cell before we return...
+                              |> fun a -> Async.StartImmediateAsTask(a, cancellationToken = tok.Token)
+        
+                        if p.RedirectStandardError then
+                            readErrorTask <-
+                              handleStream c.StandardError toolProcess.StandardError.BaseStream false
+                              // Immediate makes sure we set the ref cell before we return...
+                              |> fun a -> Async.StartImmediateAsTask(a, cancellationToken = tok.Token)
+            
+                // Wait for the process to finish
+                let! exitEvent = 
+                    toolProcess.Exited
+                        // This way the handler gets added before actually calling start or "EnableRaisingEvents"
+                        |> Event.guard start
+                        |> Async.AwaitEvent
+                        |> Async.StartImmediateAsTask
+                // Waiting for the process to exit (buffers)
+                toolProcess.WaitForExit()
+        
+                let delay = System.Threading.Tasks.Task.Delay 500
+                let all =  System.Threading.Tasks.Task.WhenAll([readErrorTask; readOutputTask; redirectStdInTask])
+                let! t = System.Threading.Tasks.Task.WhenAny(all, delay)
+                         |> Async.AwaitTask
+                if t = delay then
+                    Trace.traceFAKE "At least one redirection task did not finish: \nReadErrorTask: %O, ReadOutputTask: %O, RedirectStdInTask: %O" readErrorTask.Status readOutputTask.Status redirectStdInTask.Status
+                tok.Cancel()
+                
+                // wait for finish -> AwaitTask has a bug which makes it unusable for chanceled tasks.
+                // workaround with continuewith
+                let! streams = all.ContinueWith (new System.Func<System.Threading.Tasks.Task<Stream[]>, Stream[]> (fun t -> t.GetAwaiter().GetResult())) |> Async.AwaitTask
+                for s in streams do s.Dispose()
+                setEcho false |> ignore
+                
+                let output =
+                    match c.GetRawOutput with
+                    | Some f -> Some (f())
+                    | None -> None
+                
+                return toolProcess.ExitCode, output }
+        }
+
+
+
+//// //// //// //// Process/Proc.fs
+
+namespace Fuze.Core
+
+open System.IO
+open System.Diagnostics
+open Fuze.Core.ProcessHelpers
+
+[<AutoOpen>]
+module StreamExtensions =
+
+    type System.IO.Stream with
+        static member CombineWrite (target1:System.IO.Stream, target2:System.IO.Stream)=
+            if not target1.CanWrite || not target2.CanWrite then 
+                raise <| System.ArgumentException("Streams need to be writeable to combine them.")
+            let notsupported () = raise <| System.InvalidOperationException("operation not suppotrted")
+            { new System.IO.Stream() with
+                member __.CanRead = false
+                member __.CanSeek = false
+                member __.CanTimeout = target1.CanTimeout || target2.CanTimeout
+                member __.CanWrite = true
+                member __.Length = target1.Length
+                member __.Position with get () = target1.Position and set _ = notsupported()
+                member __.Flush () = target1.Flush(); target2.Flush()
+                member __.FlushAsync (tok) = 
+                    async {
+                        do! target1.FlushAsync(tok)
+                        do! target2.FlushAsync(tok)
+                    }
+                    |> Async.StartImmediateAsTask
+                    :> System.Threading.Tasks.Task
+                member __.Seek (_, _) = notsupported()
+                member __.SetLength (_) = notsupported()
+                member __.Read (_, _, _) = notsupported()
+                member __.Write (buffer, offset, count)=
+                    target1.Write(buffer, offset, count)
+                    target2.Write(buffer, offset, count)
+                override __.WriteAsync(buffer, offset, count, tok) =
+                    async {
+                        let! child1 = 
+                            target1.WriteAsync(buffer, offset, count, tok)
+                            |> Async.AwaitTask
+                            |> Async.StartChild
+                        let! child2 =
+                            target2.WriteAsync(buffer, offset, count, tok)
+                            |> Async.AwaitTask
+                            |> Async.StartChild
+                        do! child1
+                        do! child2
+                    }
+                    |> Async.StartImmediateAsTask
+                    :> System.Threading.Tasks.Task
+                }
+
+        static member InterceptStream (readStream:System.IO.Stream, track:System.IO.Stream)=
+            if not readStream.CanRead || not track.CanWrite then 
+                raise <| System.ArgumentException("track Stream need to be writeable and readStream readable to intercept the readStream.")
+            { new System.IO.Stream() with
+                member __.CanRead = true
+                member __.CanSeek = readStream.CanSeek
+                member __.CanTimeout = readStream.CanTimeout || track.CanTimeout
+                member __.CanWrite = readStream.CanWrite
+                member __.Length = readStream.Length
+                member __.Position with get () = readStream.Position and set v = readStream.Position <- v
+                member __.Flush () = readStream.Flush(); track.Flush()
+                member __.FlushAsync (tok) = 
+                    async {
+                        do! readStream.FlushAsync(tok)
+                        do! track.FlushAsync(tok)
+                    }
+                    |> Async.StartImmediateAsTask
+                    :> System.Threading.Tasks.Task
+                member __.Seek (offset, origin) = readStream.Seek(offset, origin)
+                member __.SetLength (l) = readStream.SetLength(l)
+                member __.Read (buffer, offset, count) =
+                    let read = readStream.Read(buffer, offset, count)
+                    track.Write(buffer, offset, read)
+                    read
+                override __.ReadAsync (buffer, offset, count, _) =
+                  async {
+                    let! read = readStream.ReadAsync(buffer, offset, count)
+                    do! track.WriteAsync(buffer, offset, read)
+                    return read
+                  }
+                  |> Async.StartImmediateAsTask
+                member __.Write (buffer, offset, count)=
+                    readStream.Write(buffer, offset, count)
+                override __.WriteAsync(buffer, offset, count, tok) =
+                    readStream.WriteAsync(buffer, offset, count, tok)
+                override __.Dispose(t) = if t then readStream.Dispose()
+                }
+
+type IProcessHook =
+    inherit System.IDisposable
+    abstract member ProcessExited : int -> unit
+    abstract member ParseSuccess : int -> unit
+type ResultGenerator<'TRes> =
+    {   GetRawOutput : unit -> ProcessOutput
+        GetResult : ProcessOutput -> 'TRes }
+type CreateProcess<'TRes> =
+    private {
+        Command : Command
+        WorkingDirectory : string option
+        Environment : (string * string) list option
+        StandardInput : StreamSpecification 
+        StandardOutput : StreamSpecification 
+        StandardError : StreamSpecification
+        GetRawOutput : (unit -> ProcessOutput) option
+        Setup : unit -> IProcessHook
+        GetResult : ProcessOutput -> 'TRes
+    }
+    member x.Proc =
+      { Command = x.Command
+        WorkingDirectory = x.WorkingDirectory
+        Environment = x.Environment
+        StandardInput = x.StandardInput
+        StandardOutput = x.StandardOutput
+        StandardError = x.StandardError
+        GetRawOutput = x.GetRawOutput }
+
+    member internal x.ToStartInfo =
+        x.Proc.ToStartInfo
+
+    member x.OutputRedirected = x.OutputRedirected
+    member x.CommandLine = x.CommandLine
+
+module CreateProcess  =
+    let emptyHook =
+        { new IProcessHook with
+            member __.Dispose () = ()
+            member __.ProcessExited _ = ()
+            member __.ParseSuccess _ = () }
+
+    let ofProc x =
+      { Command = x.Command
+        WorkingDirectory = x.WorkingDirectory
+        Environment = x.Environment
+        StandardInput = x.StandardInput
+        StandardOutput = x.StandardOutput
+        StandardError = x.StandardError
+        GetRawOutput = x.GetRawOutput
+        Setup = fun _ -> emptyHook
+        GetResult = fun _ -> () }
+
+    let fromCommand command =
+        {   Command = command
+            WorkingDirectory = None
+            // Problem: Environment not allowed when using ShellCommand
+            Environment = None
+            // Problem: Redirection not allowed when using ShellCommand
+            StandardInput = Inherit
+            // Problem: Redirection not allowed when using ShellCommand
+            StandardOutput = Inherit
+            // Problem: Redirection not allowed when using ShellCommand
+            StandardError = Inherit
+            GetRawOutput = None
+            GetResult = fun _ -> ()
+            Setup = fun _ -> emptyHook }
+    let fromRawWindowsCommandLine command windowsCommandLine =
+        fromCommand <| RawCommand(command, Arguments.OfWindowsCommandLine windowsCommandLine)
+    let fromRawCommand command args =
+        fromCommand <| RawCommand(command, Arguments.OfArgs args)
+
+    let ofStartInfo (p:System.Diagnostics.ProcessStartInfo) =
+        {   Command = if p.UseShellExecute then ShellCommand p.FileName else RawCommand(p.FileName, Arguments.OfStartInfo p.Arguments)
+            WorkingDirectory = if System.String.IsNullOrWhiteSpace p.WorkingDirectory then None else Some p.WorkingDirectory
+            Environment = 
+                p.Environment
+                |> Seq.map (fun kv -> kv.Key, kv.Value)
+                |> Seq.toList
+                |> Some
+            StandardInput = if p.RedirectStandardError then CreatePipe StreamRef.Empty else Inherit
+            StandardOutput = if p.RedirectStandardError then CreatePipe StreamRef.Empty else Inherit
+            StandardError = if p.RedirectStandardError then CreatePipe StreamRef.Empty else Inherit
+            GetRawOutput = None
+            GetResult = fun _ -> ()
+            Setup = fun _ -> emptyHook
+        } 
+    
+    let interceptStream target (s:StreamSpecification) =
+        match s with
+        | Inherit -> Inherit
+        | UseStream (close, stream) ->
+            let combined = Stream.CombineWrite(stream, target)
+            UseStream(close, combined)
+        | CreatePipe pipe ->
+            CreatePipe (StreamRef.Map (fun s -> Stream.InterceptStream(s, target)) pipe)
+    
+    let copyRedirectedProcessOutputsToStandardOutputs (c:CreateProcess<_>)=
+        { c with
+            StandardOutput =
+                let stdOut = System.Console.OpenStandardOutput()
+                interceptStream stdOut c.StandardOutput
+            StandardError =
+                let stdErr = System.Console.OpenStandardError()
+                interceptStream stdErr c.StandardError }
+    
+    let withWorkingDirectory workDir (c:CreateProcess<_>)=
+        { c with
+            WorkingDirectory = Some workDir }
+    let withCommand command (c:CreateProcess<_>)=
+        { c with
+            Command = command }
+
+    let replaceFilePath newFilePath (c:CreateProcess<_>)=
+        { c with
+            Command =
+                match c.Command with
+                | ShellCommand s -> failwith "Expected RawCommand"
+                | RawCommand (_, c) -> RawCommand(newFilePath, c) }
+    let mapFilePath f (c:CreateProcess<_>)=
+        c
+        |> replaceFilePath (f (match c.Command with ShellCommand s -> failwith "Expected RawCommand" | RawCommand (file, _) -> f file))
+
+    let private combine (d1:IProcessHook) (d2:IProcessHook) =
+        { new IProcessHook with
+            member __.Dispose () = d1.Dispose(); d2.Dispose()
+            member __.ProcessExited e = d1.ProcessExited(e); d2.ProcessExited(e)
+            member __.ParseSuccess e = d1.ParseSuccess(e); d2.ParseSuccess(e) }
+    let addSetup f (c:CreateProcess<_>) =
+        { c with
+            Setup = fun _ -> combine (c.Setup()) (f()) }
+            
+    let withEnvironment env (c:CreateProcess<_>)=
+        { c with
+            Environment = Some env }
+    let withStandardOutput stdOut (c:CreateProcess<_>)=
+        { c with
+            StandardOutput = stdOut }
+    let withStandardError stdErr (c:CreateProcess<_>)=
+        { c with
+            StandardError = stdErr }
+    let withStandardInput stdIn (c:CreateProcess<_>)=
+        { c with
+            StandardInput = stdIn }
+
+    let private withResultFuncRaw f x =
+        {   Command = x.Command
+            WorkingDirectory = x.WorkingDirectory
+            Environment = x.Environment
+            StandardInput = x.StandardInput
+            StandardOutput = x.StandardOutput
+            StandardError = x.StandardError
+            GetRawOutput = x.GetRawOutput
+            GetResult = f
+            Setup = x.Setup }
+    let map f x =
+        withResultFuncRaw (x.GetResult >> f) x
+    let redirectOutput (c:CreateProcess<_>) =
+        match c.GetRawOutput with
+        | None ->
+            let outMem = new MemoryStream()
+            let errMem = new MemoryStream()
+        
+            let getOutput () =
+                outMem.Position <- 0L
+                errMem.Position <- 0L
+                let stdErr = (new StreamReader(errMem)).ReadToEnd()
+                let stdOut = (new StreamReader(outMem)).ReadToEnd()
+                { Output = stdOut; Error = stdErr }
+
+            { c with
+                StandardOutput = UseStream (false, outMem)
+                StandardError = UseStream (false, errMem)
+                GetRawOutput = Some getOutput }
+                |> withResultFuncRaw id
+        | Some f ->
+            c |> withResultFuncRaw id
+    let withResultFunc f (x:CreateProcess<_>) =
+        match x.GetRawOutput with
+        | Some _ -> x |> withResultFuncRaw f
+        | None -> x |> redirectOutput |> withResultFuncRaw f
+         
+    let addOnExited f (r:CreateProcess<_>) =
+        r
+        |> addSetup (fun _ ->
+           { new IProcessHook with
+                member __.Dispose () = ()
+                member __.ProcessExited exitCode =
+                    if exitCode <> 0 then f exitCode
+                member __.ParseSuccess _ = () })
+    let ensureExitCodeWithMessage msg (r:CreateProcess<_>) =
+        r
+        |> addOnExited (fun exitCode ->
+            if exitCode <> 0 then failwith msg)
+            
+
+    let ensureExitCode (r:CreateProcess<_>) =
+        r
+        |> addOnExited (fun exitCode ->
+            if exitCode <> 0 then
+                let msg =
+                    match r.GetRawOutput with
+                    | Some f ->
+                        let output = f()
+                        (sprintf "Process exit code '%d' <> 0. Command Line: %s\nStdOut: %s\nStdErr: %s" exitCode r.CommandLine output.Output output.Error)
+                    | None ->
+                        (sprintf "Process exit code '%d' <> 0. Command Line: %s" exitCode r.CommandLine)
+                failwith msg    
+                )
+    
+    let warnOnExitCode msg (r:CreateProcess<_>) =
+        r
+        |> addOnExited (fun exitCode ->
+            if exitCode <> 0 then
+                let msg =
+                    match r.GetRawOutput with
+                    | Some f ->
+                        let output = f()
+                        (sprintf "%s. exit code '%d' <> 0. Command Line: %s\nStdOut: %s\nStdErr: %s" msg exitCode r.CommandLine output.Output output.Error)
+                    | None ->
+                        (sprintf "%s. exit code '%d' <> 0. Command Line: %s" msg exitCode r.CommandLine)
+                //if Env.isVerbose then
+                eprintfn "%s" msg    
+                )
+type ProcessResults<'a> =
+  { ExitCode : int
+    CreateProcess : CreateProcess<'a>
+    Result : 'a }
+module Proc =
+    let startRaw (c:CreateProcess<_>) =
+      async {
+        use hook = c.Setup()
+        
+        let! exitCode, output = RawProc.processStarter.Start(c.Proc)
+        
+        hook.ProcessExited(exitCode)
+
+        let o, realResult =
+            match output with
+            | Some f -> f, true
+            | None -> { Output = ""; Error = "" }, false
+
+        let strip (s:string) =
+            let subString (s:string) =
+                let splitMax = 300
+                let half = splitMax / 2
+                if s.Length < splitMax then s
+                else sprintf "%s [...] %s" (s.Substring(0, half)) (s.Substring(s.Length - half))
+                
+            if s.Length < 1000 then
+                s
+            else
+                let splits = s.Split([|"\n"|], System.StringSplitOptions.None)
+                if splits.Length <= 1 then
+                    // We need to use substring
+                    subString s
+                else
+                    splits
+                    |> Seq.take 10
+                    |> fun s -> Seq.append s [" [ ... ] "]
+                    |> fun s -> Seq.append s (splits |> Seq.skip (splits.Length - 10))
+                    |> Seq.map subString
+                    |> fun s -> System.String.Join("\n", s)
+                    
+        let strippedOutput = lazy strip o.Output
+        let strippedError = lazy strip o.Error
+        if realResult then
+            Trace.tracefn "Process Output: %s, Error: %s" strippedOutput.Value strippedError.Value
+
+        let result =
+            try c.GetResult o
+            with e ->
+                let msg =
+                    if realResult then
+                        sprintf "Could not parse output from process, StdOutput: %s, StdError %s" strippedOutput.Value strippedError.Value
+                    else
+                        "Could not parse output from process, but RawOutput was not retrieved."
+                raise <| System.Exception(msg, e)
+        
+        hook.ParseSuccess exitCode
+        return { ExitCode = exitCode; CreateProcess = c; Result = result }
+      }
+      // Immediate makes sure we set the ref cell before we return the task...
+      |> Async.StartImmediateAsTask
+    
+    let start c = 
+        async {
+            let! result = startRaw c
+            return result.Result
+        }
+        |> Async.StartImmediateAsTask
+
+    /// Convenience method when you immediatly want to await the result of 'start', just note that
+    /// when used incorrectly this might lead to race conditions 
+    /// (ie if you use StartAsTask and access reference cells in CreateProcess after that returns)
+    let startAndAwait c = start c |> Async.AwaitTaskWithoutAggregate
+
+    let ensureExitCodeWithMessageGetResult msg (r:ProcessResults<_>) =
+        let { Setup = f } =
+            { r.CreateProcess with Setup = fun _ -> CreateProcess.emptyHook }
+            |> CreateProcess.ensureExitCodeWithMessage msg
+        let hook = f ()
+        hook.ProcessExited r.ExitCode
+        r.Result
+
+    let getResultIgnoreExitCode (r:ProcessResults<_>) =
+        r.Result
+
+    let ensureExitCodeGetResult (r:ProcessResults<_>) =
+        let { Setup = f } =
+            { r.CreateProcess with Setup = fun _ -> CreateProcess.emptyHook }
+            |> CreateProcess.ensureExitCode
+        let hook = f ()
+        hook.ProcessExited r.ExitCode
+        r.Result
+
+    
+
+
+
+//// //// //// //// Process/Process.fs
+
+/// Contains functions which can be used to start other tools.
+
+namespace Fuze.Core
+
+open System
+open System.Diagnostics
+open System.Collections.Generic
+
+/// A record type which captures console messages
+type ConsoleMessage = 
+    { IsError : bool
+      Message : string
+      Timestamp : DateTimeOffset }
+
+/// A process result including error code, message log and errors.
+type ProcessResult = 
+    { ExitCode : int
+      Messages : List<string>
+      Errors : List<string> }
+    member x.OK = x.ExitCode = 0
+    static member New exitCode messages errors = 
+        { ExitCode = exitCode
+          Messages = messages
+          Errors = errors }
+
+module private ProcStartInfoData =
+    let defaultEnvVar = "__FAKE_CHECK_USER_ERROR"
+
+    let createEnvironmentMap () = Environment.environVars () |> Map.ofSeq |> Map.add defaultEnvVar defaultEnvVar
+
+open ProcStartInfoData
+
+type ProcStartInfo =
+    { /// Gets or sets the set of command-line arguments to use when starting the application.
+      Arguments : string
+      /// Gets or sets a value indicating whether to start the process in a new window.
+      CreateNoWindow : bool
+      /// Gets or sets a value that identifies the domain to use when starting the process. If this value is null, the UserName property must be specified in UPN format.
+      Domain : string
+      /// Gets the environment variables that apply to this process and its child processes.
+      /// NOTE: Recommendation is to not use this Field, but instead use the helper function in the Proc module (for example Process.setEnvironmentVariable)
+      /// NOTE: This field is ignored when UseShellExecute is true.
+      Environment : Map<string, string>
+#if FX_ERROR_DIALOG
+      /// Gets or sets a value indicating whether an error dialog box is displayed to the user if the process cannot be started.
+      ErrorDialog : bool
+      /// Gets or sets the window handle to use when an error dialog box is shown for a process that cannot be started.
+      ErrorDialogParentHandle  : IntPtr
+#endif  
+      /// Gets or sets the application or document to start.
+      FileName : string
+      /// true if the Windows user profile should be loaded; otherwise, false. The default is false.
+      LoadUserProfile : bool
+      // Note: No SecureString as that one is obsolete anyway and to provide a uniform API across netstandard16.
+      /// Gets or sets the user password in clear text to use when starting the process.
+      Password : string
+#if FX_WINDOWSTLE
+      /// One of the enumeration values that indicates whether the process is started in a window that is maximized, minimized, normal (neither maximized nor minimized), or not visible. The default is Normal.
+      WindowStyle : ProcessWindowStyle
+#endif  
+      /// true if error output should be written to Process.StandardError; otherwise, false. The default is false.
+      RedirectStandardError : bool
+      /// true if input should be read from Process.StandardInput; otherwise, false. The default is false.
+      RedirectStandardInput : bool
+      /// true if output should be written to Process.StandardOutput; otherwise, false. The default is false.
+      RedirectStandardOutput : bool
+      /// An object that represents the preferred encoding for error output. The default is null.
+      StandardErrorEncoding : System.Text.Encoding
+      /// An object that represents the preferred encoding for standard output. The default is null.
+      StandardOutputEncoding : System.Text.Encoding
+      /// The user name to use when starting the process. If you use the UPN format, user@DNS_domain_name, the Domain property must be null.
+      UserName : string
+      /// true if the shell should be used when starting the process; false if the process should be created directly from the executable file. The default is true.
+      UseShellExecute : bool
+#if FX_VERB
+      /// The action to take with the file that the process opens. The default is an empty string (""), which signifies no action.
+      Verb : string
+#endif
+      /// When UseShellExecute is true, the fully qualified name of the directory that contains the process to be started. When the UseShellExecute property is false, the working directory for the process to be started. The default is an empty string ("").
+      WorkingDirectory : string
+      } 
+    static member Create() =
+      { Arguments = null
+        CreateNoWindow = false
+        Domain = null
+        Environment = createEnvironmentMap()
+#if FX_ERROR_DIALOG
+        ErrorDialog = false
+        ErrorDialogParentHandle = IntPtr.Zero
+#endif    
+        FileName = ""
+        LoadUserProfile = false
+        Password = null
+#if FX_WINDOWSTLE
+        WindowStyle = ProcessWindowStyle.Normal
+#endif
+        RedirectStandardError = false
+        RedirectStandardInput = false
+        RedirectStandardOutput = false
+        StandardErrorEncoding = null
+        StandardOutputEncoding = null
+        UserName = null
+        UseShellExecute = true
+#if FX_VERB
+        Verb = ""
+#endif
+        WorkingDirectory = "" }
+    [<Obsolete("Please use 'Create()' instead and make sure to properly set Environment via Process-module funtions!")>]    
+    static member Empty = ProcStartInfo.Create()
+    /// Sets the current environment variables.
+    member x.WithEnvironment map =
+        { x with Environment = map }
+
+    member x.AsStartInfo =
+        let p = new ProcessStartInfo(x.FileName, x.Arguments)
+        p.CreateNoWindow <- x.CreateNoWindow
+        if not (isNull x.Domain) then
+            p.Domain <- x.Domain
+
+        match x.Environment |> Map.tryFind defaultEnvVar with
+        | None -> failwithf "Your environment variables look like they are set manually, but you are missing the default variables. Use the `Process.` helpers to change the 'Environment' field to inherit default values! See https://github.com/fsharp/FAKE/issues/1776#issuecomment-365431982"
+        | Some _ ->
+            if not x.UseShellExecute then  
+                p.Environment.Clear()
+                x.Environment
+                |> Map.remove defaultEnvVar
+                |> Map.iter (fun var key ->
+                    p.Environment.[var] <- key)
+
+#if FX_ERROR_DIALOG
+        if p.ErrorDialog then
+            p.ErrorDialog <- x.ErrorDialog
+            p.ErrorDialogParentHandle <- x.ErrorDialogParentHandle
+#endif
+        if x.LoadUserProfile then
+            p.LoadUserProfile <- x.LoadUserProfile
+
+        if not (isNull x.Password) then
+#if FX_PASSWORD_CLEAR_TEXT
+            p.PasswordInClearText <- x.Password
+#else
+#if FX_PASSWORD
+            p.Password <-
+               (let sec = new System.Security.SecureString()
+                x.Password |> Seq.iter (sec.AppendChar)
+                sec.MakeReadOnly()
+                sec)
+#else
+            failwithf "Password for starting a process was set but with this compiled binary neither ProcessStartInfo.Password nor ProcessStartInfo.PasswordInClearText was available."
+#endif
+#endif
+#if FX_WINDOWSTLE
+        if ProcessWindowStyle.Normal <> x.WindowStyle then
+            p.WindowStyle <- x.WindowStyle
+#endif
+        p.RedirectStandardError <- x.RedirectStandardError
+        p.RedirectStandardInput <- x.RedirectStandardInput
+        p.RedirectStandardOutput <- x.RedirectStandardOutput
+        if not (isNull x.StandardErrorEncoding) then
+            p.StandardErrorEncoding <- x.StandardErrorEncoding
+        if not (isNull x.StandardOutputEncoding) then
+            p.StandardOutputEncoding <- x.StandardOutputEncoding
+        if not (isNull x.UserName) then
+            p.UserName <- x.UserName
+        p.UseShellExecute <- x.UseShellExecute
+#if FX_VERB
+        if "" <> x.Verb then
+            p.Verb <- x.Verb
+#endif    
+        p.WorkingDirectory <- x.WorkingDirectory
+        p
+
+    /// Parameter type for process execution.
+    type ExecParams = 
+        { /// The path to the executable, without arguments. 
+          Program : string
+          /// The working directory for the program. Defaults to "".
+          WorkingDir : string
+          /// Command-line parameters in a string.
+          CommandLine : string
+          /// Command-line argument pairs. The value will be quoted if it contains
+          /// a string, and the result will be appended to the CommandLine property.
+          /// If the key ends in a letter or number, a space will be inserted between
+          /// the key and the value.
+          Args : (string * string) list }
+        /// Default parameters for process execution.
+        static member Empty =
+            { Program = ""
+              WorkingDir = ""
+              CommandLine = ""
+              Args = [] }
+
+
+namespace Fuze.Core
+
+open System
+open System.Diagnostics
+open System.IO
+open System.Threading
+open System.Text
+open System.Collections.Generic
+open Fuze.IO
+open Fuze.IO.FileSystemOperators
+open Fuze.Core.GuardedAwaitObservable
+
+[<RequireQualifiedAccess>]
+module Process =
+
+    /// Kills the given process
+    let kill (proc : Process) = 
+        Trace.tracefn "Trying to kill process %s (Id = %d)" proc.ProcessName proc.Id
+        try 
+            proc.Kill()
+        with ex -> Trace.logfn "Killing %s failed with %s" proc.ProcessName ex.Message
+
+    type ProcessList() =
+        let mutable shouldKillProcesses = true 
+        let startedProcesses = HashSet()
+        let killProcesses () = 
+            let traced = ref false
+            
+            for pid, startTime in startedProcesses do
+                try
+                    let proc = Process.GetProcessById pid
+                    
+                    // process IDs may be reused by the operating system so we need
+                    // to make sure the process is indeed the one we started
+                    if proc.StartTime = startTime && not proc.HasExited then
+                        try 
+                            if not !traced then
+                              Trace.tracefn "Killing all processes that are created by FAKE and are still running."
+                              traced := true
+
+                            Trace.logfn "Trying to kill %s" proc.ProcessName
+                            kill proc
+                        with exn -> Trace.logfn "Killing %s failed with %s" proc.ProcessName exn.Message
+                with exn -> Trace.logfn "Killing %d failed with %s" pid exn.Message
+            startedProcesses.Clear()
+        member x.KillAll() = killProcesses()
+        member x.Add (pid, startTime) = startedProcesses.Add(pid, startTime)
+        member x.SetShouldKill (enable) = shouldKillProcesses <- enable
+        member x.GetShouldKill = shouldKillProcesses
+
+        interface IDisposable with
+            member x.Dispose() =
+                if shouldKillProcesses then killProcesses()
+
+    /// [omit]
+    //let startedProcesses = HashSet()
+    let private startedProcessesVar = "Fuze.Core.Process.startedProcesses"
+    let private getStartedProcesses, _, private setStartedProcesses = 
+        Fuze.Core.Context.fakeVar startedProcessesVar
+
+    let private doWithProcessList f =
+        if Fuze.Core.Context.isFakeContext () then
+            match getStartedProcesses () with
+            | Some (h:ProcessList) -> Some(f h)
+            | None -> 
+                let h = new ProcessList()
+                setStartedProcesses (h)
+                Some (f h)
+        else None        
+
+    let private addStartedProcess (id:int, startTime:System.DateTime) =
+        doWithProcessList (fun h -> h.Add(id, startTime)) |> ignore
+
+    let setKillCreatedProcesses (enable) =
+        doWithProcessList (fun h -> h.SetShouldKill enable) |> ignore
+
+    let shouldKillCreatedProcesses () =
+        match doWithProcessList (fun h -> h.GetShouldKill) with
+        | Some v -> v
+        | None -> false
+
+    //let private monoArgumentsVar = "Fuze.Core.Process.monoArguments"
+    //let private tryGetMonoArguments, _, public setMonoArguments = 
+    //    Fuze.Core.Context.fakeVar monoArgumentsVar
+    //let getMonoArguments () =
+    //    match tryGetMonoArguments () with
+    //    | Some (args) -> args
+    //    | None -> ""
+    //
+    ///// Modifies the ProcessStartInfo according to the platform semantics
+    //let platformInfoAction (psi : ProcessStartInfo) = 
+    //    if Environment.isMono && psi.FileName.EndsWith ".exe" then 
+    //        psi.Arguments <- getMonoArguments() + " \"" + psi.FileName + "\" " + psi.Arguments
+    //        psi.FileName <- Environment.monoPath
+
+
+    /// If set to true the ProcessHelper will start all processes with a custom ProcessEncoding.
+    /// If set to false (default) only mono processes will be changed.
+    let mutable AlwaysSetProcessEncoding = false
+     
+    // The ProcessHelper will start all processes with this encoding if AlwaysSetProcessEncoding is set to true.
+    /// If AlwaysSetProcessEncoding is set to false (default) only mono processes will be changed.
+    let mutable ProcessEncoding = Encoding.UTF8
+
+    /// [omit]
+    let start (proc : Process) = 
+        //platformInfoAction proc.StartInfo
+        proc.Start() |> ignore
+        addStartedProcess(proc.Id, proc.StartTime) |> ignore
+
+    /// [omit]
+    //let mutable redirectOutputToTrace = false
+    let private redirectOutputToTraceVar = "Fuze.Core.Process.redirectOutputToTrace"
+    let private tryGetRedirectOutputToTrace, _, public setRedirectOutputToTrace = 
+        Fuze.Core.Context.fakeVarAllowNoContext redirectOutputToTraceVar
+    let getRedirectOutputToTrace () =
+        match tryGetRedirectOutputToTrace() with
+        | Some v -> v
+        | None ->
+          let shouldEnable = false
+          setRedirectOutputToTrace shouldEnable
+          shouldEnable
+
+    /// [omit]
+    //let mutable enableProcessTracing = true
+    let private enableProcessTracingVar = "Fuze.Core.Process.enableProcessTracing"
+    let private getEnableProcessTracing, private removeEnableProcessTracing, public setEnableProcessTracing = 
+        Fuze.Core.Context.fakeVarAllowNoContext enableProcessTracingVar
+    let shouldEnableProcessTracing () =
+        match getEnableProcessTracing() with
+        | Some v -> v
+        | None ->
+          let shouldEnable = Fuze.Core.Context.isFakeContext()
+          setEnableProcessTracing shouldEnable
+          shouldEnable
+
+    let defaultEnvVar = ProcStartInfoData.defaultEnvVar
+
+    let createEnvironmentMap () = ProcStartInfoData.createEnvironmentMap()
+
+
+    let inline setRedirectOutput (shouldRedirect:bool) (startInfo : ^a) =
+        //let inline getEnv s = ((^a) : (member Environment : unit -> Map<string, string>) (s))
+        let inline setRedirect s e = ((^a) : (member WithRedirectOutput : bool -> ^a) (s, e))
+        setRedirect startInfo shouldRedirect
+
+    let inline redirectOutput (startInfo : ^a) = setRedirectOutput true startInfo
+    let inline disableRedirectOutput (startInfo : ^a) = setRedirectOutput false startInfo
+
+    let inline setEnvironment (map:Map<string, string>) (startInfo : ^a) =
+        //let inline getEnv s = ((^a) : (member Environment : unit -> Map<string, string>) (s))
+        let inline setEnv s e = ((^a) : (member WithEnvironment : Map<string, string> -> ^a) (s, e))
+        setEnv startInfo map
+        //{ startInfo with Environment = map }
+
+    let disableShellExecute (startInfo : ProcStartInfo) =
+        { startInfo with UseShellExecute = false }
+
+    /// Sets the given environment variable for the given startInfo.
+    /// Existing values will be overriden.
+    let inline setEnvironmentVariable envKey (envVar:string) (startInfo : ^a) =
+        let inline getEnv s = ((^a) : (member Environment : Map<string, string>) (s))
+        let inline setEnv s e = ((^a) : (member WithEnvironment : Map<string, string> -> ^a) (s, e))
+        
+        getEnv startInfo
+        |> Map.add envKey envVar
+        |> setEnv startInfo
+        
+    /// Unsets the given environment variable for the started process
+    let inline removeEnvironmentVariable envKey (startInfo : ^a) =
+        let inline getEnv s = ((^a) : (member Environment : Map<string, string>) (s))
+        let inline setEnv s e = ((^a) : (member WithEnvironment : Map<string, string> -> ^a) (s, e))
+        
+        getEnv startInfo
+        |> Map.remove envKey
+        |> setEnv startInfo
+
+    /// Sets the given environment variables.
+    let inline setEnvironmentVariables vars (startInfo : ^a) =
+        vars
+        |> Seq.fold (fun state (newKey, newVar) ->
+                setEnvironmentVariable newKey newVar state) startInfo
+
+    /// Sets all current environment variables to their current values
+    let inline setCurrentEnvironmentVariables (startInfo : ^a) =
+        setEnvironmentVariables (Environment.environVars ()) startInfo
+        |> setEnvironmentVariable defaultEnvVar defaultEnvVar
+
+
+    let inline getProc config =
+        let startInfo : ProcStartInfo =
+            config { ProcStartInfo.Create() with UseShellExecute = false }
+        let proc = new Process()
+        proc.StartInfo <- startInfo.AsStartInfo
+        proc
+    /// Runs the given process and returns the exit code.
+    /// ## Parameters
+    ///
+    ///  - `configProcessStartInfoF` - A function which overwrites the default ProcessStartInfo.
+    ///  - `timeOut` - The timeout for the process.
+    ///  - `silent` - If this flag is set then the process output is redirected to the given output functions `errorF` and `messageF`.
+    ///  - `errorF` - A function which will be called with the error log.
+    ///  - `messageF` - A function which will be called with the message log.
+    let ExecWithLambdas configProcessStartInfoF (timeOut : TimeSpan) silent errorF messageF =
+        use proc = getProc configProcessStartInfoF
+        
+        //platformInfoAction proc.StartInfo
+        if String.isNullOrEmpty proc.StartInfo.WorkingDirectory |> not then 
+            if Directory.Exists proc.StartInfo.WorkingDirectory |> not then 
+                failwithf "Start of process %s failed. WorkingDir %s does not exist." proc.StartInfo.FileName 
+                    proc.StartInfo.WorkingDirectory
+        if silent then 
+            proc.StartInfo.RedirectStandardOutput <- true
+            proc.StartInfo.RedirectStandardError <- true
+            if Environment.isMono || AlwaysSetProcessEncoding then
+                proc.StartInfo.StandardOutputEncoding <- ProcessEncoding
+                proc.StartInfo.StandardErrorEncoding  <- ProcessEncoding
+            proc.ErrorDataReceived.Add(fun d -> 
+                if isNull d.Data |> not then errorF d.Data)
+            proc.OutputDataReceived.Add(fun d -> 
+                if isNull d.Data |> not then messageF d.Data)
+        try 
+            if shouldEnableProcessTracing() && (not <| proc.StartInfo.FileName.EndsWith "fsi.exe") then 
+                Trace.tracefn "%s %s" proc.StartInfo.FileName proc.StartInfo.Arguments
+            start proc
+        with ex -> raise <| exn(sprintf "Start of process %s failed." proc.StartInfo.FileName, ex)
+        if silent then 
+            proc.BeginErrorReadLine()
+            proc.BeginOutputReadLine()
+        if timeOut = TimeSpan.MaxValue then proc.WaitForExit()
+        else 
+            if not <| proc.WaitForExit(int timeOut.TotalMilliseconds) then 
+                try 
+                    proc.Kill()
+                with exn -> 
+                    Trace.traceError 
+                    <| sprintf "Could not kill process %s  %s after timeout." proc.StartInfo.FileName 
+                           proc.StartInfo.Arguments
+                failwithf "Process %s %s timed out." proc.StartInfo.FileName proc.StartInfo.Arguments
+        // See http://stackoverflow.com/a/16095658/1149924 why WaitForExit must be called twice.
+        proc.WaitForExit()
+        proc.ExitCode
+
+    [<System.Obsolete("use Process.ExecWithLambdas instead.")>]
+    let ExecProcessWithLambdas configProcessStartInfoF (timeOut : TimeSpan) silent errorF messageF =
+        ExecWithLambdas configProcessStartInfoF timeOut silent errorF messageF
+    /// Runs the given process and returns the process result.
+    /// ## Parameters
+    ///
+    ///  - `configProcessStartInfoF` - A function which overwrites the default ProcessStartInfo.
+    ///  - `timeOut` - The timeout for the process.
+    let ExecAndReturnMessages configProcessStartInfoF timeOut = 
+        let errors = new List<_>()
+        let messages = new List<_>()
+        let exitCode = ExecWithLambdas configProcessStartInfoF timeOut true (errors.Add) (messages.Add)
+        ProcessResult.New exitCode messages errors
+
+    [<System.Obsolete("use Process.ExecAndReturnMessages instead.")>]
+    let ExecProcessAndReturnMessages configProcessStartInfoF timeOut =
+        ExecAndReturnMessages configProcessStartInfoF timeOut
+
+    /// Runs the given process and returns the process result.
+    /// ## Parameters
+    ///
+    ///  - `configProcessStartInfoF` - A function which overwrites the default ProcessStartInfo.
+    ///  - `timeOut` - The timeout for the process.
+    let ExecRedirected configProcessStartInfoF timeOut = 
+        let messages = ref []
+        
+        let appendMessage isError msg = 
+            messages := { IsError = isError
+                          Message = msg
+                          Timestamp = DateTimeOffset.UtcNow } :: !messages
+        
+        let exitCode = 
+            ExecWithLambdas configProcessStartInfoF timeOut true (appendMessage true) (appendMessage false)
+        exitCode = 0, 
+        (!messages
+         |> List.rev
+         |> Seq.ofList)
+
+    [<System.Obsolete("use Process.ExecRedirected instead.")>]
+    let ExecProcessRedirected configProcessStartInfoF timeOut =
+        ExecRedirected configProcessStartInfoF timeOut
+
+    /// Runs the given process and returns the exit code.
+    /// ## Parameters
+    ///
+    ///  - `configProcessStartInfoF` - A function which overwrites the default ProcessStartInfo.
+    ///  - `timeOut` - The timeout for the process.
+    /// ## Sample
+    ///
+    ///     let result = ExecProcess (fun info ->  
+    ///                       info.FileName <- "c:/MyProc.exe"
+    ///                       info.WorkingDirectory <- "c:/workingDirectory"
+    ///                       info.Arguments <- "-v") (TimeSpan.FromMinutes 5.0)
+    ///     
+    ///     if result <> 0 then failwithf "MyProc.exe returned with a non-zero exit code"
+    let Exec configProcessStartInfoF timeOut = 
+        ExecWithLambdas configProcessStartInfoF timeOut (getRedirectOutputToTrace()) Trace.traceError Trace.trace
+
+    [<System.Obsolete("use Process.Exec instead.")>]
+    let ExecProcess configProcessStartInfoF timeOut =
+        Exec configProcessStartInfoF timeOut
+
+    // workaround to remove warning
+    let private myExecElevated cmd args timeout =
+    #if FX_VERB
+        Exec (fun si ->
+            { si with
+                Verb = "runas"
+                Arguments = args
+                FileName = cmd
+                UseShellExecute = true }) timeout
+    #else
+        failwithf "Elevated processes not possible with netstandard16 build."        
+    #endif
+
+    /// Runs the given process in an elevated context and returns the exit code.
+    /// ## Parameters
+    ///
+    ///  - `cmd` - The command which should be run in elavated context.
+    ///  - `args` - The process arguments.
+    ///  - `timeOut` - The timeout for the process.
+    [<Obsolete("This is currently not possible in dotnetcore")>]
+    let ExecElevated cmd args timeOut = 
+        myExecElevated cmd args timeOut
+
+    [<System.Obsolete("use Process.ExecElevated instead.")>]
+    let ExecProcessElevated cmd args timeOut =
+        myExecElevated cmd args timeOut
+
+    /// Runs the given process and returns true if the exit code was 0.
+    /// [omit]
+    let exec configProcessStartInfoF timeOut = Exec configProcessStartInfoF timeOut = 0
+
+    [<System.Obsolete("use Process.exec instead.")>]
+    let execProcess configProcessStartInfoF timeOut =
+        exec configProcessStartInfoF timeOut
+
+    /// Starts the given process and returns immediatly.
+    let fireAndForget configProcessStartInfoF =
+        use proc = getProc configProcessStartInfoF
+        try 
+            start proc
+        with ex -> raise <| exn(sprintf "Start of process %s failed." proc.StartInfo.FileName, ex)
+
+    /// Runs the given process, waits for its completion and returns if it succeeded.
+    let directExec configProcessStartInfoF = 
+        use proc = getProc configProcessStartInfoF
+        try 
+            start proc
+        with ex -> raise <| exn(sprintf "Start of process %s failed." proc.StartInfo.FileName, ex)
+        proc.WaitForExit()
+        proc.ExitCode = 0
+
+    /// Starts the given process and forgets about it.
+    let Start configProcessStartInfoF = 
+        use proc = getProc configProcessStartInfoF
+        start proc
+
+    [<System.Obsolete("use Process.Start instead.")>]
+    let StartProcess configProcessStartInfoF = 
+        Start configProcessStartInfoF
+        
+    /// Adds quotes around the string
+    /// [omit]
+    let quote (str:string) = "\"" + str.Replace("\"","\\\"") + "\""
+
+    /// Adds quotes around the string if needed
+    /// [omit]
+    let quoteIfNeeded str = 
+        if String.isNullOrEmpty str then ""
+        elif str.Contains " " then quote str
+        else str
+
+    /// Adds quotes and a blank around the string?.
+    /// [omit]
+    let toParam x = " " + quoteIfNeeded x
+
+    /// Use default Parameters
+    /// [omit]
+    let UseDefaults = id
+
+    /// [omit]
+    let stringParam (paramName, paramValue) = 
+        if String.isNullOrEmpty paramValue then None
+        else Some(paramName, quote paramValue)
+
+    /// [omit]
+    let multipleStringParams paramName = Seq.map (fun x -> stringParam (paramName, x)) >> Seq.toList
+
+    /// [omit]
+    let optionParam (paramName, paramValue) = 
+        match paramValue with
+        | Some x -> Some(paramName, x.ToString())
+        | None -> None
+
+    /// [omit]
+    let boolParam (paramName, paramValue) = 
+        if paramValue then Some(paramName, null)
+        else None
+
+    /// [omit]
+    let parametersToString flagPrefix delimiter parameters = 
+        parameters
+        |> Seq.choose id
+        |> Seq.map (fun (paramName, paramValue) -> 
+               flagPrefix + paramName + if String.isNullOrEmpty paramValue then ""
+                                        else delimiter + paramValue)
+        |> String.separated " "
+
+    /// Searches the given directories for all occurrences of the given file name
+    /// [omit]
+    let tryFindFile dirs file = 
+        let files = 
+            dirs
+            |> Seq.map (fun (path : string) -> 
+                   let dir = 
+                       path
+                       |> String.replace "[ProgramFiles]" Environment.ProgramFiles
+                       |> String.replace "[ProgramFilesX86]" Environment.ProgramFilesX86
+                       |> String.replace "[SystemRoot]" Environment.SystemRoot
+                       |> DirectoryInfo.ofPath
+                   if not dir.Exists then ""
+                   else 
+                       let fi = dir.FullName @@ file
+                                |> FileInfo.ofPath
+                       if fi.Exists then fi.FullName
+                       else "")
+            |> Seq.filter ((<>) "")
+            |> Seq.cache
+        if not (Seq.isEmpty files) then Some(Seq.head files)
+        else None
+
+    /// Searches the given directories for the given file, failing if not found.
+    /// [omit]
+    let findFile dirs file = 
+        match tryFindFile dirs file with
+        | Some found -> found
+        | None -> failwithf "%s not found in %A." file dirs
+
+    /// Searches the current directory and the directories within the PATH
+    /// environment variable for the given file. If successful returns the full
+    /// path to the file.
+    /// ## Parameters
+    ///  - `file` - The file to locate
+    let tryFindFileOnPath (file : string) : string option =
+        Environment.pathDirectories
+        |> Seq.filter Path.isValidPath
+        |> Seq.append [ "." ]
+        |> fun path ->
+            // See https://unix.stackexchange.com/questions/280528/is-there-a-unix-equivalent-of-the-windows-environment-variable-pathext
+            if Environment.isWindows then
+                Environment.environVarOrDefault "PATHEXT" ".COM;.EXE;.BAT"
+                |> String.split ';'
+                |> Seq.tryPick (fun postFix -> tryFindFile path (file + postFix))
+            else tryFindFile path file
+
+    /// Returns the AppSettings for the key - Splitted on ;
+    /// [omit]
+    [<Obsolete("This is no longer supported on dotnetcore.")>]
+    let appSettings (key : string) (fallbackValue : string) = 
+        let value = 
+            let setting =
+    #if FX_CONFIGURATION_MANAGER
+                try
+                    System.Configuration.ConfigurationManager.AppSettings.[key]
+                with exn -> ""
+    #else
+                null
+    #endif
+            if not (String.isNullOrWhiteSpace setting) then setting
+            else fallbackValue
+        value.Split([| ';' |], StringSplitOptions.RemoveEmptyEntries)
+
+    /// Tries to find the tool via Env-Var. If no path has the right tool we are trying the PATH system variable.
+    let tryFindTool envVar tool =
+        match Environment.environVarOrNone envVar with
+        | Some path -> Some path
+        | None -> tryFindFileOnPath tool
+
+    /// Tries to find the tool via AppSettings. If no path has the right tool we are trying the PATH system variable.
+    /// [omit]
+    let tryFindPath settingsName fallbackValue tool = 
+        let paths = appSettings settingsName fallbackValue
+        match tryFindFile paths tool with
+        | Some path -> Some path
+        | None -> tryFindFileOnPath tool
+
+    /// Tries to find the tool via AppSettings. If no path has the right tool we are trying the PATH system variable.
+    /// [omit]
+    let findPath settingsName fallbackValue tool = 
+        match tryFindPath settingsName fallbackValue tool with
+        | Some file -> file
+        | None -> tool
+
+    let private formatArgs args = 
+        let delimit (str : string) = 
+            if String.isLetterOrDigit (str.Chars(str.Length - 1)) then str + " "
+            else str
+        args
+        |> Seq.map (fun (k, v) -> delimit k + quoteIfNeeded v)
+        |> String.separated " "
+
+    /// Execute an external program asynchronously and return the exit code,
+    /// logging output and error messages to FAKE output. You can compose the result
+    /// with Async.Parallel to run multiple external programs at once, but be
+    /// sure that none of them depend on the output of another.
+    let asyncShellExec (args : ExecParams) = 
+        async { 
+            if String.isNullOrEmpty args.Program then invalidArg "args" "You must specify a program to run!"
+            let commandLine = args.CommandLine + " " + formatArgs args.Args
+            let info = 
+                ProcessStartInfo
+                    (args.Program, UseShellExecute = false, 
+                     RedirectStandardError = true, RedirectStandardOutput = true, RedirectStandardInput = true,
+    #if FX_WINDOWSTLE
+                     WindowStyle = ProcessWindowStyle.Hidden,
+    #else
+                     CreateNoWindow = true,
+    #endif
+                     WorkingDirectory = args.WorkingDir, 
+                     Arguments = commandLine)
+            use proc = new Process(StartInfo = info)
+            proc.ErrorDataReceived.Add(fun e -> 
+                if not (isNull e.Data) then Trace.traceError e.Data)
+            proc.OutputDataReceived.Add(fun e -> 
+                if not (isNull e.Data) then Trace.log e.Data)
+            start proc
+            proc.BeginOutputReadLine()
+            proc.BeginErrorReadLine()
+            proc.StandardInput.Dispose()
+            // attaches handler to Exited event, enables raising events, then awaits event
+            // the event gets triggered even if process has already finished
+            let! _ = Async.GuardedAwaitObservable proc.Exited (fun _ -> proc.EnableRaisingEvents <- true)
+            return proc.ExitCode
+        }
+
+
+    /// Kills all processes with the given id
+    let killById id = Process.GetProcessById id |> kill
+    [<System.Obsolete("use Process.killById instead.")>]
+    let killProcessById id = killById id
+
+    /// Returns all processes with the given name
+    let getAllByName (name : string) = 
+        Process.GetProcesses()
+        |> Seq.filter (fun p -> 
+               try 
+                   not p.HasExited
+               with exn -> false)
+        |> Seq.filter (fun p -> 
+               try 
+                   p.ProcessName.ToLower().StartsWith(name.ToLower())
+               with exn -> false)
+
+    [<System.Obsolete("use Process.getAllByName instead.")>]
+    let getProcessesByName name = getAllByName name
+
+    /// Kills all processes with the given name
+    let killAllByName name = 
+        Trace.tracefn "Searching for process with name = %s" name
+        getAllByName name |> Seq.iter kill
+
+    [<System.Obsolete("use Process.killAllByName instead.")>]
+    let killProcess name = killAllByName name
+
+    /// Kills the F# Interactive (FSI) process.
+    let killFSI() = killAllByName "fsi.exe"
+
+    /// Kills the MSBuild process.
+    let killMSBuild() = killAllByName "msbuild"
+
+    /// Kills all processes that are created by the FAKE build script unless "donotkill" flag was set.
+    let killAllCreatedProcesses() =
+        match getStartedProcesses() with
+        | Some startedProcesses when shouldKillCreatedProcesses() ->
+            startedProcesses.KillAll()
+        | _ -> ()
+
+    /// Waits until the processes with the given name have stopped or fails after given timeout.
+    /// ## Parameters
+    ///  - `name` - The name of the processes in question.
+    ///  - `timeout` - The timespan to time out after.
+    let ensureProcessesHaveStopped name timeout =
+        let endTime = DateTime.Now.Add timeout
+        while DateTime.Now <= endTime && not (getAllByName name |> Seq.isEmpty) do
+            Trace.tracefn "Waiting for %s to stop (Timeout: %A)" name endTime
+            Thread.Sleep 1000
+        if not (getAllByName name |> Seq.isEmpty) then
+            failwithf "The process %s has not stopped (check the logs for errors)" name
+
+    /// Execute an external program and return the exit code.
+    /// [omit]
+    let shellExec args = args |> asyncShellExec |> Async.RunSynchronously
+
+
+    let internal monoPath, monoVersion =
+        match tryFindTool "MONO" "mono" with
+        | Some path ->
+            let success, messages =
+                try ExecRedirected(fun proc ->
+                        { proc with
+                            FileName = path
+                            Arguments = "--version" }) (TimeSpan.FromMinutes 1.)
+                with e ->
+                    false,
+                    [{ ConsoleMessage.IsError = true; ConsoleMessage.Message = e.ToString(); ConsoleMessage.Timestamp = DateTimeOffset.Now }]
+                    |> List.toSeq
+            let out =
+                let outStr = String.Join("\n", messages |> Seq.map (fun m -> m.Message))
+                sprintf "Success: %b, Out: %s" success outStr
+            let ver =
+                match success, messages |> Seq.tryHead with
+                | true, Some firstLine ->
+                    Some (out, Environment.Internal.parseMonoDisplayName firstLine.Message)
+                | _ ->
+                    Some (out, None)
+            Some path, ver
+        | None -> None, None
+
+    /// Ensures the executable is run with the full framework. On non-windows platforms that means running the tool by invoking 'mono'.
+    let withFramework (proc:ProcStartInfo) =
+        match Environment.isWindows, proc.FileName.ToLowerInvariant().EndsWith(".exe"), monoPath with
+        | false, true, Some monoPath ->
+            { proc with 
+                Arguments =  "--debug \"" + proc.FileName + "\" " + proc.Arguments
+                FileName = monoPath }
+        | false, true, _ ->
+            failwithf "trying to start a .NET process on a non-windows platform, but mono could not be found. Try to set the MONO environment variable or add mono to the PATH."
+        | _ -> proc
+
+    [<System.Obsolete("use Fuze.Core.ProcStartInfo instead")>]
+    type ProcStartInfo = Fuze.Core.ProcStartInfo
+    [<System.Obsolete("use Fuze.Core.ExecParams instead")>]
+    type ExecParams = Fuze.Core.ExecParams
+    [<System.Obsolete("use Fuze.Core.ProcessResult instead")>]
+    type ProcessResult = Fuze.Core.ProcessResult
+    [<System.Obsolete("use Fuze.Core.ConsoleMessage instead")>]
+    type ConsoleMessage = Fuze.Core.ConsoleMessage
+
+/// Allows to exec shell operations synchronously and asynchronously.
+type Shell private() = 
+    static member private GetParams(cmd, ?args, ?dir) = 
+        let args = defaultArg args ""
+        let dir = defaultArg dir (Directory.GetCurrentDirectory())
+        { WorkingDir = dir
+          Program = cmd
+          CommandLine = args
+          Args = [] }
+    
+    /// Runs the given process, waits for it's completion and returns the exit code.
+    /// ## Parameters
+    ///
+    ///  - `cmd` - The command which should be run in elavated context.
+    ///  - `args` - The process arguments (optional).
+    ///  - `directory` - The working directory (optional).
+    static member Exec(cmd, ?args, ?dir) = Process.shellExec (Shell.GetParams(cmd, ?args = args, ?dir = dir))
+    
+    /// Runs the given process asynchronously.
+    /// ## Parameters
+    ///
+    ///  - `cmd` - The command which should be run in elavated context.
+    ///  - `args` - The process arguments (optional).
+    ///  - `directory` - The working directory (optional).
+    static member AsyncExec(cmd, ?args, ?dir) = Process.asyncShellExec (Shell.GetParams(cmd, ?args = args, ?dir = dir))
+
+[<AutoOpen>]
+module ProcStartInfoExtensions =
+    type ProcStartInfo with
+        /// Gets or sets the set of command-line arguments to use when starting the application.
+        member x.WithArguments args = { x with Arguments = args }
+        /// Gets or sets a value indicating whether to start the process in a new window.
+        member x.WithCreateNoWindow noWindow = { x with CreateNoWindow = noWindow }
+        /// Gets or sets a value that identifies the domain to use when starting the process.
+        member x.WithDomain domain = { x with Domain = domain }
+        /// Remove the current Environment Variables and use the default
+        member x.WithoutEnvironment () = { x with Environment = Map.empty } |> Process.setCurrentEnvironmentVariables
+        /// Sets the given environment variable for the given startInfo.
+        member x.WithEnvironmentVariable(envKey, envVar) =
+            Process.setEnvironmentVariable envKey envVar x
+        /// Unsets the given environment variable for the given startInfo.
+        member x.WithRemovedEnvironmentVariable(envKey) =
+            Process.removeEnvironmentVariable envKey x
+        /// Gets or sets a value that identifies the domain to use when starting the process.
+        member x.WithEnvironmentVariables vars =
+            Process.setEnvironmentVariables vars x
+        /// Sets the current environment variables.
+        member x.WithCurrentEnvironmentVariables () =
+            Process.setCurrentEnvironmentVariables x
+
+#if FX_ERROR_DIALOG
+        /// Gets or sets a value indicating whether an error dialog box is displayed to the user if the process cannot be started.
+        member x.WithErrorDialog errorDialog = { x with ErrorDialog = errorDialog }
+        /// Gets or sets the window handle to use when an error dialog box is shown for a process that cannot be started.
+        member x.WithErrorDialogParentHandle handle = { x with ErrorDialogParentHandle = handle }
+#endif  
+        /// Gets or sets the application or document to start.
+        member x.WithFileName name = { x with FileName = name }
+        /// true if the Windows user profile should be loaded; otherwise, false. The default is false.
+        member x.WithLoadUserProfile userProfile = { x with LoadUserProfile = userProfile }
+        // Note: No SecureString as that one is obsolete anyway and to provide a uniform API across netstandard16.
+        /// Gets or sets the user password in clear text to use when starting the process.
+        member x.WithPassword password = { x with Password = password }
+#if FX_WINDOWSTLE
+        /// One of the enumeration values that indicates whether the process is started in a window that is maximized, minimized, normal (neither maximized nor minimized), or not visible. The default is Normal.
+        member x.WithWindowStyle style = { x with WindowStyle = style }
+#endif  
+        /// true if error output should be written to Process.StandardError; otherwise, false. The default is false.
+        member x.WithRedirectStandardError redirectStdErr = { x with RedirectStandardError = redirectStdErr }
+        /// true if input should be read from Process.StandardInput; otherwise, false. The default is false.
+        member x.WithRedirectStandardInput redirectStdInput = { x with RedirectStandardInput = redirectStdInput }
+        /// true if output should be written to Process.StandardOutput; otherwise, false. The default is false.
+        member x.WithRedirectStandardOutput redirectStdOutput = { x with RedirectStandardOutput = redirectStdOutput }
+        /// An object that represents the preferred encoding for error output. The default is null.
+        member x.WithStandardErrorEncoding encoding = { x with StandardErrorEncoding = encoding }
+        /// An object that represents the preferred encoding for standard output. The default is null.
+        member x.WithStandardOutputEncoding encoding = { x with StandardOutputEncoding = encoding }
+        /// The user name to use when starting the process. If you use the UPN format, user@DNS_domain_name, the Domain property must be null.
+        member x.WithUserName name = { x with UserName = name }
+        /// true if the shell should be used when starting the process; false if the process should be created directly from the executable file. The default is true.
+        member x.WithUseShellExecute shellExec = { x with UseShellExecute = shellExec }
+#if FX_VERB
+        /// The action to take with the file that the process opens. The default is an empty string (""), which signifies no action.
+        member x.WithVerb name = { x with Verb = name }
+#endif
+        /// When UseShellExecute is true, the fully qualified name of the directory that contains the process to be started. When the UseShellExecute property is false, the working directory for the process to be started. The default is an empty string ("").
+        member x.WithWorkingDirectory dir = { x with WorkingDirectory = dir }
+
+
+
+//// //// //// //// Process/Mono.fs
+
+
+namespace Fuze.Core
+module Mono=
+
+    open Fuze.Core
+    open System
+
+    let monoPath, monoVersion = Process.monoPath, Process.monoVersion
 
 
 

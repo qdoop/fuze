@@ -1,6 +1,6 @@
 namespace Fuze
 
-#nowarn "20"
+#nowarn "20" "44"
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
